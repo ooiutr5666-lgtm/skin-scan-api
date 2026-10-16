@@ -278,16 +278,7 @@ def extract_handcrafted(img_rgb):
 
 # ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold)
 def check_is_skin(img_rgb):
-    if not OPENCV_AVAILABLE:
-        return True
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    # ช่วงสีผิวทั่วไปใน HSV
-    lower_skin = np.array([0, 15, 40], dtype=np.uint8)
-    upper_skin = np.array([30, 255, 255], dtype=np.uint8)
-    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
-    ratio = float(skin_mask.sum()) / (255.0 * img_rgb.shape[0] * img_rgb.shape[1])
-    return ratio > 0.15 # ถ้ามีพื้นที่สีผิวเกิน 15% ถือว่าเป็นภาพผิวหนัง
-
+    return True # อนุญาตให้ภาพรอยโรคทุกประเภทเข้าสู่การวิเคราะห์โมเดล
 @app.get("/")
 def read_root():
     model_loaded = (get_trained_pipeline() is not None)
