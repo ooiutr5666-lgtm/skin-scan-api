@@ -323,29 +323,11 @@ async def predict(file: UploadFile = File(...)):
     # สกัด Features 58 ตัว + รอยโรคที่แบ่งส่วนได้ตามสูตรโครงงาน
     feats, mask, cleaned = extract_handcrafted(img_rgb)
 
-    # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check)
-    # ไม่แตะต้องโมเดล SVM แต่ป้องกันไม่ให้ภาพผิวปกติเรียบเนียนถูกวิเคราะห์ผิด
+    # ส่งทุกรอยโรคผิวหนังเข้าสู่โมเดล SVM (รวมทั้งรอยโรคสีจาง/สีชมพู)
     inside = mask > 0
-    outside = ~inside
-    has_lesion = True
-
-    if inside.sum() < (224 * 224 * 0.005) or outside.sum() < (224 * 224 * 0.05):
-        has_lesion = False
-    else:
-        gray = cv2.cvtColor(cleaned, cv2.COLOR_RGB2GRAY)
-        lum_diff = float(gray[outside].mean() - gray[inside].mean())
-        contrast = feats.get('C_contrast_to_skin', 0.0)
-        # หากความเข้มไม่ต่างจากผิว (< 7) และสีไม่ต่างจากผิวรอบข้าง (< 12.0) ถือเป็นผิวปกติ
-        if lum_diff < 7.0 and contrast < 12.0:
-            has_lesion = False
-
-    if not has_lesion:
-        return {
-            "is_skin": True,
-            "has_lesion": False,
-            "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ภาพอยู่นอกเหนือขอบเขตการคัดกรอง: ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะรอยโรคผิวหนัง (Malignant vs. Benign) ตามเล่มโครงงาน กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
-        }
-
+    if inside.sum() < 20:
+        h, w = cleaned.shape[:2]
+        cv2.circle(mask, (w // 2, h // 2), min(h, w) // 4, 255, -1)
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
