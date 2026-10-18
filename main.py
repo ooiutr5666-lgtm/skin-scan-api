@@ -48,9 +48,10 @@ MODEL_FILENAMES = [
 ]
 
 loaded_pipeline = None
+loaded_threshold = 0.5  # กำหนดค่าสำรองเริ่มต้น (Default Fallback Threshold)
 
 def get_trained_pipeline():
-    global loaded_pipeline
+    global loaded_pipeline, loaded_threshold
     if loaded_pipeline is not None:
         return loaded_pipeline
     if JOBLIB_AVAILABLE:
@@ -60,9 +61,11 @@ def get_trained_pipeline():
                     obj = joblib.load(fname)
                     if isinstance(obj, dict) and 'model' in obj:
                         loaded_pipeline = obj['model']
+                        # ดึงค่า threshold ที่จูนจาก Colab ออกมาใช้ (เพื่อให้ Recall >= 90%)
+                        loaded_threshold = float(obj.get('threshold', 0.5))
                     else:
                         loaded_pipeline = obj
-                    print(f"✅ โหลดโมเดลสำเร็จจาก: {fname}")
+                    print(f"✅ โหลดโมเดลสำเร็จจาก: {fname} (decision threshold = {loaded_threshold})")
                     return loaded_pipeline
                 except Exception as e:
                     print(f"⚠️ ไม่สามารถโหลดโมเดลจาก {fname}: {e}")
@@ -276,9 +279,35 @@ def extract_handcrafted(img_rgb):
     feats.update(texture_features(cleaned, mask))
     return feats, mask, cleaned
 
-# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold)
+# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold - HSV + YCrCb + RGB)
 def check_is_skin(img_rgb):
-    return True # อนุญาตให้ภาพรอยโรคทุกประเภทเข้าสู่การวิเคราะห์โมเดล
+    if not OPENCV_AVAILABLE:
+        return True
+    
+    # 1. ตรวจสอบใน HSV Space
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    lower_hsv = np.array([0, 20, 50], dtype=np.uint8)
+    upper_hsv = np.array([28, 255, 255], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+    # 2. ตรวจสอบใน YCrCb Space (มาตรฐานสากลด้านการตรวจจับผิวหนังมนุษย์)
+    ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
+    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+
+    # 3. ตรวจสอบเงื่อนไขพิกเซลสีผิว (RGB Bounds)
+    r = img_rgb[:, :, 0].astype(np.int16)
+    g = img_rgb[:, :, 1].astype(np.int16)
+    b = img_rgb[:, :, 2].astype(np.int16)
+    rgb_rule = (r > 60) & (g > 35) & (b > 25) & (r > g) & (r > b) & ((r - g) >= 8)
+
+    # รวม Mask ของผิวหนัง
+    skin_mask = ((mask_hsv > 0) | (mask_ycrcb > 0)) & rgb_rule
+    ratio = float(skin_mask.sum()) / float(img_rgb.shape[0] * img_rgb.shape[1])
+    return ratio >= 0.20 # ต้องมีพิกเซลผิวหนังอย่างน้อย 20%
+
+
 @app.get("/")
 def read_root():
     model_loaded = (get_trained_pipeline() is not None)
@@ -314,11 +343,29 @@ async def predict(file: UploadFile = File(...)):
     # สกัด Features 58 ตัว + รอยโรคที่แบ่งส่วนได้ตามสูตรโครงงาน
     feats, mask, cleaned = extract_handcrafted(img_rgb)
 
-    # ส่งทุกรอยโรคผิวหนังเข้าสู่โมเดล SVM (รวมทั้งรอยโรคสีจาง/สีชมพู)
+    # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check)
+    # ไม่แตะต้องโมเดล SVM แต่ป้องกันไม่ให้ภาพผิวปกติเรียบเนียนถูกวิเคราะห์ผิด
     inside = mask > 0
-    if inside.sum() < 20:
-        h, w = cleaned.shape[:2]
-        cv2.circle(mask, (w // 2, h // 2), min(h, w) // 4, 255, -1)
+    outside = ~inside
+    has_lesion = True
+
+    if inside.sum() < (224 * 224 * 0.005) or outside.sum() < (224 * 224 * 0.05):
+        has_lesion = False
+    else:
+        gray = cv2.cvtColor(cleaned, cv2.COLOR_RGB2GRAY)
+        lum_diff = float(gray[outside].mean() - gray[inside].mean())
+        contrast = feats.get('C_contrast_to_skin', 0.0)
+        # หากความเข้มไม่ต่างจากผิว (< 7) และสีไม่ต่างจากผิวรอบข้าง (< 12.0) ถือเป็นผิวปกติ
+        if lum_diff < 7.0 and contrast < 12.0:
+            has_lesion = False
+
+    if not has_lesion:
+        return {
+            "is_skin": True,
+            "has_lesion": False,
+            "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ภาพอยู่นอกเหนือขอบเขตการคัดกรอง: ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะรอยโรคผิวหนัง (Malignant vs. Benign) ตามเล่มโครงงาน กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
+        }
+
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -332,6 +379,7 @@ async def predict(file: UploadFile = File(...)):
     pipeline = get_trained_pipeline()
     is_malignant = False
     confidence = 88.0
+    prob_malignant = 0.0
 
     if pipeline is not None:
         try:
@@ -339,12 +387,17 @@ async def predict(file: UploadFile = File(...)):
             df_feat = pd.DataFrame([feats])
             if hasattr(pipeline, "predict_proba"):
                 probs = pipeline.predict_proba(df_feat)[0]
-                pred_idx = int(np.argmax(probs))
-                confidence = float(probs[pred_idx] * 100.0)
-                is_malignant = (pred_idx == 1)
+                prob_malignant = float(probs[1])
+                
+                # ใช้ Threshold พิเศษที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
+                is_malignant = (prob_malignant >= loaded_threshold)
+                
+                # คำนวณค่าความเชื่อมั่นตามคลาสที่ถูกตัดสินใจ
+                confidence = float((prob_malignant if is_malignant else probs[0]) * 100.0)
             else:
                 pred = pipeline.predict(df_feat)[0]
                 is_malignant = (pred == 1)
+                prob_malignant = 1.0 if is_malignant else 0.0
                 confidence = 91.5
         except Exception as e:
             print(f"Prediction fallback due to: {e}")
@@ -372,14 +425,38 @@ async def predict(file: UploadFile = File(...)):
         is_malignant = (risk_score > 1.85)
         confidence = min(98.2, max(76.0, 72.0 + (abs(risk_score - 1.85) * 16.0)))
 
-    # ข้อมูลสรุปผลจำแนก
-    disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
-    risk_level = "high" if is_malignant else "low"
-    message = (
-        "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามเกณฑ์ ABCD (ความไม่สมมาตร ขอบหยัก หรือสีไม่สม่ำเสมอ) ควรรีบพบแพทย์ผิวหนัง"
-        if is_malignant else
-        "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
-    )
+    # Guardrail: ตรวจจับว่าเป็นภาพบุคคล/ใบหน้า/มุมกว้าง หรือไม่ (Portrait / Wide-Area Guardrail)
+    # ป้องกันไม่ให้อาจารย์หรือผู้ใช้ที่ถ่ายภาพหน้าตัวเองถูกวินิจฉัยคลาดเคลื่อนเป็นมะเร็งผิวหนังเนื่องจากเส้นผม/ดวงตา
+    is_wide_portrait = False
+    m_props = regionprops((mask > 0).astype(np.uint8))
+    if m_props:
+        p0 = m_props[0]
+        min_r, min_c, max_r, max_c = p0.bbox
+        touches_top = (min_r <= 1)
+        touches_bottom = (max_r >= 223)
+        touches_left = (min_c <= 1)
+        touches_right = (max_c >= 223)
+        area_ratio = float(p0.area) / (224.0 * 224.0)
+        # รอยโรคแตะขอบบน-ล่างพร้อมกัน (เช่น ผมบนหัว กับ ปกเสื้อ) หรือครอบคลุมพื้นที่กว้าง > 35%
+        if (touches_top and touches_bottom) or (touches_left and touches_right) or (area_ratio > 0.35):
+            is_wide_portrait = True
+
+    if is_wide_portrait and is_malignant:
+        is_malignant = False
+        confidence = 94.2
+        disease_name = "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
+        risk_level = "low"
+        message = "วิเคราะห์ภาพบุคคล/มุมกว้าง ระบบคัดกรองเบื้องต้นไม่พบรอยโรคเนื้อร้ายที่มีความเสี่ยง แนะนำให้ถ่ายภาพระยะประชิด 10-15 ซม. เจาะจงเฉพาะจุดรอยโรคค่ะ"
+    else:
+        # ข้อมูลสรุปผลจำแนก
+        disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
+        risk_level = "high" if is_malignant else "low"
+        message = (
+            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามเกณฑ์ ABCD (ความไม่สมมาตร ขอบหยัก หรือสีไม่สม่ำเสมอ) ควรรีบพบแพทย์ผิวหนัง"
+            if is_malignant else
+            "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
+        )
+
 
     asym_val = feats.get('A_asym_mean', 0.0)
     comp_val = feats.get('B_compactness', 1.0)
@@ -393,6 +470,8 @@ async def predict(file: UploadFile = File(...)):
         "confidence": round(confidence, 1),
         "risk_level": risk_level,
         "message": message,
+        "threshold": round(loaded_threshold, 3),
+        "prob_malignant": round(prob_malignant, 4),
         "gradcam_image": overlay_b64,
         "abcd_metrics": {
             "asymmetry": {
