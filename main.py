@@ -450,6 +450,28 @@ async def predict(file: UploadFile = File(...)):
             "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ภาพอยู่นอกเหนือขอบเขตการคัดกรอง: ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะรอยโรคผิวหนัง (Malignant vs. Benign) ตามเล่มโครงงาน กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
         }
 
+    # ด่านตรวจภาพนอกขอบเขตโมเดล (Out-of-Scope Guard)
+    # โมเดลเทรนจากภาพรอยโรคระยะประชิด (ISIC) รอยโรคต้องมีขนาดพอสมควรและไม่เต็มทั้งเฟรม
+    # ภาพใบหน้า/มุมกว้างที่ไฝเป็นจุดเล็กๆ หรือ segmentation ได้ทั้งเฟรม จึงไม่ควรส่งให้โมเดลทำนาย
+    total_px = float(mask.shape[0] * mask.shape[1])
+    lesion_ratio = float(inside.sum()) / total_px
+    ys, xs = np.where(inside)
+    borders_touched = int(ys.min() == 0) + int(ys.max() == mask.shape[0] - 1) + \
+        int(xs.min() == 0) + int(xs.max() == mask.shape[1] - 1)
+    out_of_scope = (lesion_ratio < 0.015) or (lesion_ratio > 0.75) or \
+        (borders_touched >= 3 and lesion_ratio > 0.45)
+    if out_of_scope:
+        return {
+            "is_skin": True,
+            "is_out_of_scope": True,
+            "predicted_disease": "ไม่สามารถประเมินผลได้",
+            "confidence": 0.0,
+            "risk_level": "uncertain",
+            "lesion_area_ratio": round(lesion_ratio, 4),
+            "message": "ภาพนี้อยู่นอกเหนือขอบเขตของโมเดล (เช่น ภาพใบหน้า/ภาพมุมกว้าง หรือรอยโรคเล็ก/ใหญ่เกินกรอบ) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด กรุณาถ่ายระยะประชิด 10–15 ซม. ให้เห็นไฝหรือรอยโรคเต็มกรอบค่ะ",
+            "gradcam_image": None
+        }
+
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
