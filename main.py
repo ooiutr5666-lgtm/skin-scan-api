@@ -176,10 +176,15 @@ def _otsu_pick(M, h, w):
     lab = label(mask > 0)
     best, best_score = None, -1
     for r in regionprops(lab):
+        if r.area < (0.002 * h * w):
+            continue
         cy, cx = r.centroid
         dist = np.hypot(cy - h / 2, cx - w / 2) / (np.hypot(h / 2, w / 2) + 1e-6)
-        touches_border = (r.bbox[0] == 0 or r.bbox[1] == 0 or r.bbox[2] == h or r.bbox[3] == w)
-        score = r.area * (1 - dist) * (0.3 if touches_border else 1.0)
+        b_hits = int(r.bbox[0] <= 1) + int(r.bbox[1] <= 1) + int(r.bbox[2] >= h - 2) + int(r.bbox[3] >= w - 2)
+        if b_hits >= 2:
+            continue  # ชิ้นส่วนที่แตะขอบภาพตั้งแต่ 2 ด้าน (ริมฝีปาก/ขอบเสื้อ) ตัดทิ้งทันที
+        penalty = 0.1 if b_hits == 1 else 1.0
+        score = float(r.area) * (max(0.0, 1.0 - dist) ** 1.2) * penalty
         if score > best_score:
             best, best_score = r.label, score
     if best is None:
