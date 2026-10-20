@@ -164,7 +164,7 @@ def predict_cnn_prob(img_rgb):
         if loaded_cnn_type == 'onnx':
             input_name = cnn.get_inputs()[0].name
             preds = cnn.run(None, {input_name: x})[0]
-            return float(preds[0][0])
+            return float(np.squeeze(preds))
         elif loaded_cnn_type == 'tflite':
             input_details = cnn.get_input_details()
             output_details = cnn.get_output_details()
