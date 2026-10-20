@@ -568,63 +568,16 @@ async def predict(file: UploadFile = File(...)):
         seg_q = 1.0
         seg_method = 'legacy'
 
-    # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check - รองรับไฝขนาดเล็กตั้งแต่ 0.2%)
+    # ตรวจสอบการมีอยู่ของรอยโรค
     inside = mask > 0
-    outside = ~inside
-    total_px = float(mask.shape[0] * mask.shape[1])
-    lesion_ratio = float(inside.sum()) / total_px
-
-    if inside.sum() < (224 * 224 * 0.002) or outside.sum() < (224 * 224 * 0.05) or (FEATURES_MODULE_AVAILABLE and seg_q < 0.03):
+    if inside.sum() < 30:
         return {
             "is_skin": True,
             "has_lesion": False,
             "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
             "confidence": 0.0,
             "risk_level": "uncertain",
-            "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ภาพอยู่นอกเหนือขอบเขตการคัดกรอง: ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะรอยโรคผิวหนัง (Malignant vs. Benign) ตามเล่มโครงงาน กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
-        }
-
-    # ด่านตรวจภาพนอกขอบเขตโมเดล (Out-of-Scope Guard)
-    ys, xs = np.where(inside)
-    borders_touched = int(ys.min() == 0) + int(ys.max() == mask.shape[0] - 1) + \
-        int(xs.min() == 0) + int(xs.max() == mask.shape[1] - 1)
-    
-    edge_px = int((mask[:2, :] > 0).sum() + (mask[-2:, :] > 0).sum() +
-                  (mask[:, :2] > 0).sum() + (mask[:, -2:] > 0).sum())
-
-    out_of_scope = (lesion_ratio < 0.002) or (lesion_ratio > 0.65) or \
-        (borders_touched >= 2 and lesion_ratio > 0.12) or \
-        (borders_touched >= 1 and edge_px > 15 and lesion_ratio > 0.10) or \
-        (borders_touched >= 3) or \
-        (FEATURES_MODULE_AVAILABLE and seg_q < 0.04 and seg_method == 'fallback_ellipse')
-
-    if out_of_scope:
-        return {
-            "is_skin": True,
-            "is_out_of_scope": True,
-            "predicted_disease": "ไม่สามารถประเมินผลได้",
-            "confidence": 0.0,
-            "risk_level": "uncertain",
-            "lesion_area_ratio": round(lesion_ratio, 4),
-            "message": "ภาพนี้อยู่นอกเหนือขอบเขตของโมเดล (รอยโรคไม่อยู่กึ่งกลางภาพ ชิดขอบ หรือเป็นรอยปื้นกว้าง) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด กรุณาถ่ายระยะประชิด 10–15 ซม. โดยจัดให้ไฝหรือรอยโรคอยู่ตรงกลางภาพค่ะ",
-            "gradcam_image": None
-        }
-
-    # ด่านตรวจจับเม็ดสีเมลานิน (Melanin Pigment & Clinical Scope Guard)
-    # รอยโรคในชุดข้อมูล ISIC (Melanocytic Nevi / Melanoma) ต้องมีเม็ดสีเมลานินเข้ม
-    # หากตรวจพบว่าเป็นเพียงรอยแดง/ผื่นอักเสบ/สิว (Erythematous/Inflammatory) ที่ไม่มีเม็ดสีเมลานินเข้ม
-    # ระบบจะปฏิเสธการประเมินเพื่อความปลอดภัยทางการแพทย์ (Safe AI Concept) เพื่อไม่ให้สับสนกับโรคมะเร็ง
-    is_pigmented, pigment_category = check_melanin_pigmentation(img_rgb, mask)
-    if not is_pigmented:
-        return {
-            "is_skin": True,
-            "is_out_of_scope": True,
-            "clinical_category": "erythematous_rash_or_acne",
-            "predicted_disease": "ไม่สามารถประเมินผลได้",
-            "confidence": 0.0,
-            "risk_level": "uncertain",
-            "message": "ตรวจพบลักษณะเป็นผื่นแดงหรือการอักเสบของผิวหนัง (Erythema / Inflammatory Skin Condition) โดยไม่พบกลุ่มเม็ดสีเมลานินเข้มของไฝ (Non-pigmented)\n\nระบบ Skin Scan ถูกพัฒนาด้วยชุดข้อมูล ISIC เพื่อคัดกรองเฉพาะ 'ไฝและมะเร็งผิวหนังชนิดมีเม็ดสี' (Melanocytic Lesions) จึงปฏิเสธการประเมินเพื่อความปลอดภัยทางการแพทย์ เพื่อป้องกันไม่ให้เกิดความเข้าใจผิด แนะนำปรึกษาแพทย์เฉพาะทางผิวหนังเพื่อตรวจรักษาอาการผื่นหรือสิวค่ะ",
-            "gradcam_image": None
+            "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
         }
 
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
@@ -708,13 +661,12 @@ async def predict(file: UploadFile = File(...)):
             detail=f"โมเดลไม่สามารถประมวลผลการจำแนกได้: {str(e)}"
         )
 
-    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 68%)
-    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 68% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
-    is_uncertain = (confidence < 68.0)
+    # ผลลัพธ์การจำแนกตามเกณฑ์โมเดล ISIC (Decision Threshold จาก Colab)
+    is_uncertain = (confidence < 35.0)
     if is_uncertain:
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
         risk_level = "uncertain"
-        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย 68% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
+        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย จึงไม่สามารถสรุปผลได้ชัดเจน แนะนำปรึกษาแพทย์เฉพาะทางผิวหนัง"
     else:
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"

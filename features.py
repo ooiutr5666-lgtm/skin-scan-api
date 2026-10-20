@@ -30,12 +30,9 @@ def remove_hair(img_rgb):
 
 
 def _clean(mask):
-    # ใช้ MORPH_OPEN ขนาด (5, 5) เพื่อตัดคอคอดหรือเส้นเชื่อมระหว่างรอยโรคกับริมฝีปาก/เงา
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=2)
-    # ใช้ MORPH_CLOSE ขนาดเล็ก (3, 3) เพียงรอบเดียวเพื่อเติมรูเล็กๆ ภายในตัวไฝ ไม่ให้เชื่อมข้ามไปยังริมฝีปาก
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=1)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
     return mask
 
 
@@ -43,84 +40,49 @@ def _quality(mask):
     """ให้คะแนน mask 0..1: อยู่กลางภาพ, ขนาดพอดี, ไม่แนบขอบภาพ, รูปทรงไม่แตกกระจาย"""
     h, w = mask.shape
     m = mask > 0
-    area = float(m.sum())
-    frac = area / float(h * w)
-    # อนุญาตให้จับไฝขนาดเล็กตั้งแต่ 0.2% ของภาพ (ประมาณ 100 พิกเซล) ถึง 65%
-    if frac < 0.002 or frac > 0.65:
+    area = m.sum()
+    frac = area / (h * w)
+    if frac < 0.015 or frac > 0.70:
         return 0.0
     ys, xs = np.where(m)
-    if len(ys) == 0:
-        return 0.0
-    cy, cx = float(ys.mean()), float(xs.mean())
+    cy, cx = ys.mean(), xs.mean()
     dist = np.hypot(cy - h / 2, cx - w / 2) / np.hypot(h / 2, w / 2)
-
-    # ตรวจสอบการติดขอบภาพ (ขอบ 3 px)
+    # สัดส่วนของ mask ที่ติดขอบภาพ (ขอบ 2 px)
     edge = np.zeros_like(m)
-    edge[:3, :] = edge[-3:, :] = edge[:, :3] = edge[:, -3:] = True
-    touch_px = int((m & edge).sum())
-    borders_hit = int(ys.min() <= 2) + int(ys.max() >= h - 3) + int(xs.min() <= 2) + int(xs.max() >= w - 3)
-
-    # หากติดขอบภาพตั้งแต่ 2 ด้านขึ้นไป หรือติดขอบด้านใดด้านหนึ่งเกิน 15 พิกเซล (เช่น ริมฝีปากที่ขอบล่าง) ให้คะแนนเป็น 0 ทันที
-    if borders_hit >= 2 or touch_px > 15:
-        return 0.0
-    
-    if touch_px > 0:
-        border_penalty = 0.05
-    else:
-        border_penalty = 1.0
-
-    cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts:
-        return 0.0
+    edge[:2, :] = edge[-2:, :] = edge[:, :2] = edge[:, -2:] = True
+    border_touch = (m & edge).sum() / max(1, 2 * (h + w) * 2)
+    border_touch = min(1.0, border_touch * 8)
+    cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_NONE)
     hull_area = cv2.contourArea(cv2.convexHull(max(cnts, key=cv2.contourArea))) + 1e-6
-    solidity = min(1.0, area / hull_area)
-
-    # ให้คะแนนตามขนาด: รองรับไฝทั่วไป (0.5% - 25% ของภาพ) ได้คะแนนเต็ม 1.0
-    if 0.005 <= frac <= 0.25:
-        size_score = 1.0
-    elif frac < 0.005:
-        size_score = max(0.3, frac / 0.005)
-    else:
-        size_score = max(0.1, 1.0 - (frac - 0.25) / 0.40)
-
-    return float(size_score * (max(0.0, 1.0 - dist) ** 1.2) * border_penalty * solidity)
+    solidity = area / hull_area
+    size_score = 1.0 - abs(frac - 0.18) / 0.55          # ชอบ ~18% ของภาพ
+    return float(max(0.0, size_score) * (1 - dist) ** 1.5 *
+                 (1 - border_touch) * solidity)
 
 
 def _pick(M, valid, h, w):
-    """Otsu แบบ Multi-Level เพื่อแยกเม็ดไฝสีเข้มออกจากเนื้อเยื่อข้างเคียง (เช่น ริมฝีปาก)"""
-    M_smooth = cv2.GaussianBlur(M.astype(np.float32), (5, 5), 0)
-    vals = M_smooth[valid]
-    if vals.size < 50 or vals.std() < 1e-3:
+    """Otsu เฉพาะ pixel ที่ valid แล้วเลือก component ที่อยู่กลางภาพและไม่แนบขอบ"""
+    M = cv2.GaussianBlur(M.astype(np.float32), (5, 5), 0)
+    vals = M[valid]
+    if vals.size < 100 or vals.std() < 1e-3:
         return None
-    t0 = threshold_otsu(vals)
-    val_max = float(vals.max())
-    
-    # ทดสอบ 3 ระดับ Threshold เพื่อค้นหาเม็ดสีที่เข้มที่สุด (ไฝ) แยกขาดจากริมฝีปาก
-    thresholds = [t0]
-    if val_max > t0:
-        thresholds.append(t0 + 0.25 * (val_max - t0))
-        thresholds.append(t0 + 0.45 * (val_max - t0))
-
+    t = threshold_otsu(vals)
+    mask = ((M > t) & valid).astype(np.uint8) * 255
+    mask = _clean(mask)
+    lab = label(mask > 0)
     best, best_s = None, 0.0
-    for t in thresholds:
-        raw_mask = ((M_smooth > t) & valid).astype(np.uint8) * 255
-        cleaned_mask = _clean(raw_mask)
-        lab = label(cleaned_mask > 0)
-        for r in regionprops(lab):
-            if r.area < 0.002 * h * w:
-                continue
-            comp = (lab == r.label).astype(np.uint8) * 255
-            s = _quality(comp)
-            if t > t0:
-                s *= 1.2  # โบนัสความเข้มคมชัดของเม็ดสีไฝ
-            if s > best_s:
-                best, best_s = comp, s
-
+    for r in regionprops(lab):
+        if r.area < 0.01 * h * w:
+            continue
+        comp = (lab == r.label).astype(np.uint8) * 255
+        s = _quality(comp)
+        if s > best_s:
+            best, best_s = comp, s
     if best is None:
         return None
     cnts, _ = cv2.findContours(best, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if cnts:
-        cv2.drawContours(best, cnts, -1, 255, -1)       # เติมรู
+    cv2.drawContours(best, cnts, -1, 255, -1)       # เติมรู
     return best
 
 
@@ -166,98 +128,48 @@ def _grabcut(img_rgb):
     best = max(regionprops(lab), key=lambda r: r.area)
     out = (lab == best.label).astype(np.uint8) * 255
     cnts, _ = cv2.findContours(out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if cnts:
-        cv2.drawContours(out, cnts, -1, 255, -1)
+    cv2.drawContours(out, cnts, -1, 255, -1)
     return out
 
 
-MIN_QUALITY = 0.08
+MIN_QUALITY = 0.12
 
 
 def segment_lesion(img_rgb, return_info=False):
-    """แยกรอยโรคผิวหนังอย่างแม่นยำระดับการแพทย์ (Dermatological Melanin Detection)
-    1. วัดค่าความมืดของเม็ดสีเมลานินเทียบกับผิวหนังปกติรอบข้าง
-    2. คัดแยกเฉพาะก้อนเม็ดสีเข้ม (ไฝ) โดยไม่เชื่อมต่อกับริมฝีปาก เลือด หรือขอบภาพ
-    3. ปฏิเสธวัตถุที่แตะขอบภาพอย่างเด็ดขาด
-    """
     h, w = img_rgb.shape[:2]
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    L = lab[..., 0]
-
-    # ตัดขอบมืดของกล้องออก
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+    S = hsv[..., 1]
     valid = ~_frame_mask(L)
-    if valid.sum() < 100:
+    if valid.mean() < 0.3:
         valid = np.ones((h, w), bool)
 
-    # 1. ประมาณค่าความสว่างเฉลี่ยของผิวหนังปกติ (Skin Baseline)
-    skin_L = float(np.median(L[valid]))
-
-    # 2. แผนที่ความมืดเทียบกับผิว (Melanin Darkness Map)
-    darkness = np.clip(skin_L - L, 0.0, 255.0)
-    darkness_valid = darkness[valid]
-    max_dark = float(darkness_valid.max()) if darkness_valid.size > 0 else 0.0
-
-    # หากภาพนี้ไม่มีส่วนใดมืดกว่าผิวอย่างมีนัยสำคัญ (น้อยกว่า 12 หน่วย)
-    if max_dark < 12.0:
-        return (None, {'method': 'none', 'quality': 0.0}) if return_info else None
-
-    # 3. ค้นหา Component ของไฝโดยเน้นระดับความเข้มของเม็ดสีเมลานิน (Melanin Focus)
-    # ไฝจะมีความเข้มสูงกว่าริมฝีปากหรือเงามาก เริ่มจากระดับเข้มสุดลงมา
-    best_comp = None
-    best_score = 0.0
-    k_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-    for ratio in [0.60, 0.45, 0.32, 0.20]:
-        thresh = max(14.0, max_dark * ratio)
-        raw_mask = ((darkness >= thresh) & valid).astype(np.uint8) * 255
-        
-        # ทำความสะอาดด้วย Opening ขนาดเล็ก 3x3 เพียง 1 รอบ เพื่อลบ noise โดยไม่กลืนไฝเล็ก
-        cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, k_clean, iterations=1)
-        
-        lab_map = label(cleaned > 0)
-        for r in regionprops(lab_map):
-            area = float(r.area)
-            frac = area / float(h * w)
-            # ขนาดไฝต้องอยู่ในช่วง 0.1% ถึง 50% ของภาพ
-            if frac < 0.001 or frac > 0.50:
-                continue
-
-            # ตรวจสอบการแตะขอบภาพ (ริมฝีปาก, ขอบเสื้อ, ขอบภาพ)
-            touches_border = (r.bbox[0] <= 1 or r.bbox[1] <= 1 or 
-                              r.bbox[2] >= h - 2 or r.bbox[3] >= w - 2)
-            if touches_border:
-                continue  # วัตถุที่แตะขอบภาพถูกตัดทิ้งทันที!
-
-            cy, cx = r.centroid
-            dist = np.hypot(cy - h / 2, cx - w / 2) / np.hypot(h / 2, w / 2)
-
-            comp = (lab_map == r.label).astype(np.uint8) * 255
-            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            if not cnts:
-                continue
-            hull_area = cv2.contourArea(cv2.convexHull(max(cnts, key=cv2.contourArea))) + 1e-6
-            solidity = min(1.0, area / hull_area)
-
-            # ให้คะแนน: ยิ่งทึบแน่นกลม (solidity สูง), เม็ดสีเข้มคมชัด (ratio สูง), ไม่ติดขอบ ยิ่งได้คะแนนสูง
-            score = float(solidity * (max(0.0, 1.0 - 0.4 * dist)) * (1.0 + ratio))
-            if score > best_score:
-                best_score = score
-                best_comp = comp
-
-        # หากพบลักษณะไฝที่ชัดเจนและทึบแน่นแล้ว ให้เลือกทันที ไม่ต้องลด threshold ให้ไปโดนปาก
-        if best_comp is not None and best_score > 0.70:
-            break
-
-    if best_comp is None:
-        # หากไม่พบรอยโรคที่ชัดเจน คืนค่า None ทันที ห้ามสร้างวงรีปลอมเด็ดขาด
-        return (None, {'method': 'none', 'quality': 0.0}) if return_info else None
-
-    # เติมรูภายในตัวไฝ
-    cnts, _ = cv2.findContours(best_comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if cnts:
-        cv2.drawContours(best_comp, cnts, -1, 255, -1)
-
-    return (best_comp, {'method': 'melanin_otsu', 'quality': float(best_score)}) if return_info else best_comp
+    maps = {
+        'L': _flat_map(L, valid),                         # เข้มกว่าผิวรอบข้าง
+        'a': -_flat_map(A, valid),                        # แดงกว่า
+        'S': -_flat_map(S, valid),                        # อิ่มสีกว่า
+        'Lab': np.sqrt(sum(_flat_map(c, valid) ** 2 for c in (L, A, B))),  # ต่างสีรวม
+    }
+    cands = []
+    for name, M in maps.items():
+        m = _pick(M, valid, h, w)
+        if m is not None:
+            cands.append((_quality(m), name, m))
+    method = 'none'
+    mask, q = None, 0.0
+    if cands:
+        q, method, mask = max(cands, key=lambda t: t[0])
+    if mask is None or q < MIN_QUALITY:
+        g = _grabcut(img_rgb)
+        gq = _quality(g) if g is not None else 0.0
+        if g is not None and gq > q:
+            mask, q, method = g, gq, 'grabcut'
+    if mask is None or q < 0.02:                          # สุดท้ายจริง ๆ: วงรีกลางภาพ
+        mask = np.zeros((h, w), np.uint8)
+        cv2.ellipse(mask, (w // 2, h // 2), (w // 5, h // 5), 0, 0, 360, 255, -1)
+        method, q = 'fallback_ellipse', 0.0
+    return (mask, {'method': method, 'quality': q}) if return_info else mask
 
 
 # 3) A – Asymmetry
