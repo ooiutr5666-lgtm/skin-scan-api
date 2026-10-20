@@ -105,9 +105,19 @@ def get_trained_pipeline():
             if os.path.exists(fname):
                 try:
                     obj = joblib.load(fname)
-                    if isinstance(obj, dict) and 'model' in obj:
-                        loaded_pipeline = obj['model']
-                        loaded_threshold = float(obj.get('threshold', 0.5))
+                    if isinstance(obj, dict):
+                        # รองรับทั้งคีย์ 'model', 'hand' (Handcrafted Pipeline), และ 'pipeline'
+                        loaded_pipeline = obj.get('model') or obj.get('hand') or obj.get('pipeline') or obj.get('clf')
+                        if loaded_pipeline is None:
+                            # หากไม่มีคีย์ข้างต้น ให้ค้นหา object ตัวแรกที่เป็น Pipeline หรือ Classifier ใน dict
+                            for v in obj.values():
+                                if hasattr(v, 'predict') or hasattr(v, 'predict_proba'):
+                                    loaded_pipeline = v
+                                    break
+                        if loaded_pipeline is None:
+                            loaded_pipeline = obj
+
+                        loaded_threshold = float(obj.get('threshold') or obj.get('t_hi') or obj.get('t_lo') or 0.5)
                         loaded_feat_cols = obj.get('feat_cols', None)
                         loaded_ood = obj.get('ood', None)
                         if 'classes' in obj:
