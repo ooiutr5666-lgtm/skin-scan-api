@@ -39,8 +39,9 @@ app.add_middleware(
 
 CLASSES = ['benign', 'malignant'] # 0 = benign (ไฝปกติ), 1 = malignant (มะเร็งผิวหนัง)
 
-# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (ให้ skin_cancer_pipeline.joblib มีลำดับความสำคัญสูงสุด)
+# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (ให้ bundle.joblib มีลำดับความสำคัญสูงสุด)
 MODEL_FILENAMES = [
+    'bundle.joblib',
     'skin_cancer_pipeline.joblib',
     'skin_cancer_pipeline (2).joblib',
     'skin_cancer_pipeline (1).joblib',
