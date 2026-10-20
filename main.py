@@ -797,9 +797,20 @@ async def predict(file: UploadFile = File(...)):
         # ตรวจสอบกรณีเป็นภาพผิวหนังปกติที่ไม่มีรอยโรคชัดเจน และ AI ประเมินว่าความเสี่ยงต่ำ
         is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.30)
 
+        # ตรวจสอบผื่นแดงหรือรอยระคายเคืองที่ไม่มีเม็ดสีเมลานินคล้ำ (Erythema / Rash Guard)
+        # รอยโรคที่มีสีแดงเด่นชัดแต่ไม่มีเม็ดสีคล้ำ/ดำ (L และ V ยังสว่าง) และ CNN ไม่ได้ชี้ว่าเป็นมะเร็งขั้นรุนแรง
+        c_r = feats.get('C_R_mean', 0.0)
+        c_g = feats.get('C_G_mean', 0.0)
+        c_b = feats.get('C_B_mean', 0.0)
+        c_v = feats.get('C_V_mean', 0.0)
+        c_l = feats.get('C_L_mean', 0.0)
+        is_red_rash = (c_r > 115 and c_r > c_g * 1.10 and c_r > c_b * 1.10) and (c_v > 105 or c_l > 110) and (prob_cnn is None or prob_cnn < 0.60)
+
         # คำนวณค่าความเชื่อมั่นแบบปรับเทียบ (Calibrated Confidence)
         if is_plain_normal_skin:
             confidence = float(min(max((1.0 - prob_malignant) * 100.0, 92.0), 98.5))
+        elif is_red_rash:
+            confidence = float(min(max((1.0 - (prob_cnn or 0.2)) * 100.0, 85.0), 96.0))
         elif is_malignant:
             if prob_malignant >= loaded_t_hi:
                 confidence = float(prob_malignant * 100.0)
@@ -821,6 +832,11 @@ async def predict(file: UploadFile = File(...)):
         disease_name = "ผิวหนังปกติ (Normal Skin)"
         risk_level = "low"
         message = "ภาพถ่ายผิวหนังมีลักษณะเรียบเนียนตามปกติ ไม่พบรอยโรคหรือเม็ดไฝที่มีความเสี่ยงของเนื้อร้าย"
+    elif is_red_rash:
+        is_uncertain = False
+        disease_name = "ผิวปกติ / ไม่พบเนื้อร้าย (ตรวจพบผื่นแดง/การระคายเคือง)"
+        risk_level = "low"
+        message = "ภาพตรวจพบผื่นแดงหรือรอยระคายเคืองผิวหนัง ไม่พบการสะสมของเม็ดสีเมลานินผิดปกติ และไม่พบสัญญาณของมะเร็งผิวหนัง"
     elif seg_q < 0.15 and not is_malignant and prob_cnn is None:
         is_uncertain = True
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
