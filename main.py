@@ -84,9 +84,10 @@ loaded_pipeline = None
 loaded_threshold = 0.5  # กำหนดค่าสำรองเริ่มต้น (Default Fallback Threshold)
 loaded_feat_cols = None
 loaded_classes = [0, 1]
+loaded_ood = None  # ตัวตรวจภาพนอกขอบเขต (Mahalanobis) จาก Colab ถ้ามี
 
 def get_trained_pipeline():
-    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes
+    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes, loaded_ood
     if loaded_pipeline is not None:
         return loaded_pipeline
     if JOBLIB_AVAILABLE:
@@ -104,6 +105,7 @@ def get_trained_pipeline():
                         loaded_pipeline = obj['model']
                         loaded_threshold = float(obj.get('threshold', 0.5))
                         loaded_feat_cols = obj.get('feat_cols', None)
+                        loaded_ood = obj.get('ood', None)
                         if 'classes' in obj:
                             loaded_classes = list(obj['classes'])
                     else:
@@ -500,6 +502,28 @@ async def predict(file: UploadFile = File(...)):
         df_feat = df_feat[active_feat_cols]
         # ล้างค่า NaN และ Infinity ที่อาจเกิดจากการคำนวณทางสถิติ เพื่อไม่ให้โมเดล Error
         df_feat = df_feat.fillna(0.0).replace([np.inf, -np.inf], 0.0)
+
+        # ตัวตรวจภาพนอกขอบเขต (OOD): วัดระยะ Mahalanobis ของฟีเจอร์ภาพนี้จากชุดเทรน
+        # ใช้งานเมื่อไฟล์โมเดลมีค่า 'ood' ที่สร้างจากเซลล์ Colab (ไม่มีก็ข้ามไป)
+        if loaded_ood:
+            try:
+                x = (df_feat.values[0] - np.asarray(loaded_ood['mean'])) / np.asarray(loaded_ood['scale'])
+                diff = x - np.asarray(loaded_ood['center'])
+                ood_dist = float(np.sqrt(max(diff @ np.asarray(loaded_ood['inv_cov']) @ diff, 0.0)))
+                if ood_dist > float(loaded_ood['threshold']):
+                    return {
+                        "is_skin": True,
+                        "is_out_of_scope": True,
+                        "predicted_disease": "ไม่สามารถประเมินผลได้",
+                        "confidence": 0.0,
+                        "risk_level": "uncertain",
+                        "ood_distance": round(ood_dist, 2),
+                        "ood_threshold": round(float(loaded_ood['threshold']), 2),
+                        "message": "ลักษณะภาพนี้ต่างจากรอยโรคที่โมเดลเคยเรียนมาก (เช่น สิว ผื่น หรือผิวที่ไม่ใช่ไฝ) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด หากกังวลควรปรึกษาแพทย์ผิวหนังโดยตรงค่ะ",
+                        "gradcam_image": None
+                    }
+            except Exception as ood_err:
+                print(f"[WARN] OOD check skipped: {ood_err}")
 
         # 2. ค้นหาตำแหน่ง index ของคลาส malignant ใน classes_ ของโมเดลจริง
         malignant_idx = 1
