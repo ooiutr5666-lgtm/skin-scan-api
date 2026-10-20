@@ -226,7 +226,8 @@ def get_trained_pipeline():
 
                         loaded_t_hi = float(obj.get('t_hi', 0.51))
                         loaded_t_lo = float(obj.get('t_lo', 0.22))
-                        loaded_threshold = float(obj.get('threshold') or loaded_t_hi)
+                        # ใช้ t_lo เป็นเกณฑ์คัดกรองหลัก (Screening Threshold) เพื่อให้ Recall >= 98% ไม่หลุดมะเร็ง
+                        loaded_threshold = float(loaded_t_lo)
                         loaded_w_cnn = float(obj.get('w_cnn', 0.7 if get_trained_cnn() is not None else 0.0))
                         loaded_feat_cols = obj.get('feat_cols', None)
                         loaded_ood = obj.get('ood', None)
@@ -778,11 +779,21 @@ async def predict(file: UploadFile = File(...)):
             prob_malignant = prob_hand
             active_model_desc = "Handcrafted ABCD + SVM Pipeline (SVM 100%)"
 
-        # ใช้ Decision Threshold ที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
-        is_malignant = (prob_malignant >= loaded_threshold)
+        # เกณฑ์ตัดสินตาม Colab v4 (t_lo = 0.22, t_hi = 0.51):
+        # ในการคัดกรองมะเร็งผิวหนัง (Cancer Screening) ต้องใช้ t_lo เพื่อให้ Recall >= 98% (ไม่หลุดมะเร็ง)
+        is_malignant = (prob_malignant >= loaded_t_lo)
 
-        # คำนวณค่าความเชื่อมั่นตามคลาสที่โมเดลตัดสินใจจริง
-        confidence = float((prob_malignant if is_malignant else (1.0 - prob_malignant)) * 100.0)
+        # คำนวณค่าความเชื่อมั่นแบบปรับเทียบตามเกณฑ์คัดกรอง (Calibrated Screening Confidence)
+        if is_malignant:
+            if prob_malignant >= loaded_t_hi:
+                confidence = float(prob_malignant * 100.0)
+            else:
+                # ช่วงตรวจพบความเสี่ยงสูงกว่าเกณฑ์คัดกรอง (t_lo <= P < t_hi)
+                calibrated = 50.0 + ((prob_malignant - loaded_t_lo) / max(1.0 - loaded_t_lo, 1e-6)) * 50.0
+                confidence = float(min(max(calibrated, 50.0), 99.0))
+        else:
+            calibrated = 50.0 + ((loaded_t_lo - prob_malignant) / max(loaded_t_lo, 1e-6)) * 50.0
+            confidence = float(min(max(calibrated, 50.0), 99.0))
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -790,16 +801,17 @@ async def predict(file: UploadFile = File(...)):
         )
 
     # ผลลัพธ์การจำแนกตามเกณฑ์โมเดล ISIC (Decision Threshold จาก Colab)
-    is_uncertain = (confidence < 35.0)
-    if is_uncertain:
+    if seg_q < 0.15 and not is_malignant:
+        is_uncertain = True
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
         risk_level = "uncertain"
-        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย จึงไม่สามารถสรุปผลได้ชัดเจน แนะนำปรึกษาแพทย์เฉพาะทางผิวหนัง"
+        message = "แยกขอบเขตรอยโรคออกจากผิวหนังได้ไม่ชัดเจน เพื่อความปลอดภัยทางการแพทย์จึงไม่ฟันธงผล กรุณาถ่ายภาพระยะประชิดให้ชัดเจนอีกครั้งค่ะ"
     else:
+        is_uncertain = False
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"
         message = (
-            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามเกณฑ์ ABCD (ความไม่สมมาตร ขอบหยัก หรือสีไม่สม่ำเสมอ) ควรรีบพบแพทย์ผิวหนัง"
+            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามเกณฑ์ ABCD และโครงสร้างเซลล์ (ความเสี่ยงสูงกว่าเกณฑ์ความปลอดภัย) ควรรีบพบแพทย์ผิวหนังโดยเร็ว"
             if is_malignant else
             "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
         )
@@ -818,6 +830,8 @@ async def predict(file: UploadFile = File(...)):
         "risk_level": risk_level,
         "message": message,
         "threshold": round(loaded_threshold, 3),
+        "threshold_screening": round(loaded_t_lo, 3),
+        "threshold_precision": round(loaded_t_hi, 3),
         "prob_malignant": round(prob_malignant, 4),
         "prob_cnn": round(prob_cnn, 4) if prob_cnn is not None else None,
         "prob_hand": round(prob_hand, 4),
