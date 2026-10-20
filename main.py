@@ -1,9 +1,10 @@
 import io
 import os
+import glob
 import base64
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -38,37 +39,88 @@ app.add_middleware(
 
 CLASSES = ['benign', 'malignant'] # 0 = benign (ไฝปกติ), 1 = malignant (มะเร็งผิวหนัง)
 
-# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (Pipeline จากขั้นตอนที่ 8 หรือ 9)
+# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (เรียงตามลำดับความสำคัญ และรองรับชื่อไฟล์ที่ดาวน์โหลดซ้ำ)
 MODEL_FILENAMES = [
+    'model (1).joblib',
+    'model (2).joblib',
+    'model.joblib',
+    'skin_cancer_pipeline (1).joblib',
     'skin_cancer_pipeline.joblib',
     'skin_cancer_model.joblib',
-    'pipeline.pkl',
-    'model.joblib',
-    'model.pkl'
+    'model.pkl',
+    'pipeline.pkl'
+]
+
+# รายชื่อ 58 ฟีเจอร์มาตรฐานตาม Colab (เรียงตามลำดับการสกัดเป๊ะ 100%)
+DEFAULT_FEAT_COLS = [
+    # A – Asymmetry (3)
+    'A_asym_horizontal', 'A_asym_vertical', 'A_asym_mean',
+    # B & D – Border & Diameter (10)
+    'B_compactness', 'B_solidity', 'B_convexity', 'B_eccentricity', 'B_extent',
+    'D_area', 'D_perimeter', 'D_equiv_diameter', 'D_major_axis', 'D_minor_axis',
+    # C – Color RGB (9)
+    'C_R_mean', 'C_R_std', 'C_R_skew',
+    'C_G_mean', 'C_G_std', 'C_G_skew',
+    'C_B_mean', 'C_B_std', 'C_B_skew',
+    # C – Color HSV (9)
+    'C_H_mean', 'C_H_std', 'C_H_skew',
+    'C_S_mean', 'C_S_std', 'C_S_skew',
+    'C_V_mean', 'C_V_std', 'C_V_skew',
+    # C – Color Lab (9)
+    'C_L_mean', 'C_L_std', 'C_L_skew',
+    'C_a_mean', 'C_a_std', 'C_a_skew',
+    'C_b_mean', 'C_b_std', 'C_b_skew',
+    # C – Contrast & Color count (2)
+    'C_contrast_to_skin', 'C_n_colors',
+    # Texture – GLCM (6)
+    'T_glcm_contrast', 'T_glcm_dissimilarity', 'T_glcm_homogeneity',
+    'T_glcm_energy', 'T_glcm_correlation', 'T_glcm_ASM',
+    # Texture – LBP (10)
+    'T_lbp_0', 'T_lbp_1', 'T_lbp_2', 'T_lbp_3', 'T_lbp_4',
+    'T_lbp_5', 'T_lbp_6', 'T_lbp_7', 'T_lbp_8', 'T_lbp_9'
 ]
 
 loaded_pipeline = None
 loaded_threshold = 0.5  # กำหนดค่าสำรองเริ่มต้น (Default Fallback Threshold)
+loaded_feat_cols = None
+loaded_classes = [0, 1]
 
 def get_trained_pipeline():
-    global loaded_pipeline, loaded_threshold
+    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes
     if loaded_pipeline is not None:
         return loaded_pipeline
     if JOBLIB_AVAILABLE:
-        for fname in MODEL_FILENAMES:
+        # ค้นหาตามรายชื่อที่พบบ่อย และค้นหาไฟล์ .joblib หรือ .pkl ทั้งหมดในโฟลเดอร์
+        candidates = list(MODEL_FILENAMES)
+        for f in glob.glob("*.joblib") + glob.glob("*.pkl"):
+            if f not in candidates:
+                candidates.append(f)
+
+        for fname in candidates:
             if os.path.exists(fname):
                 try:
                     obj = joblib.load(fname)
                     if isinstance(obj, dict) and 'model' in obj:
                         loaded_pipeline = obj['model']
-                        # ดึงค่า threshold ที่จูนจาก Colab ออกมาใช้ (เพื่อให้ Recall >= 90%)
                         loaded_threshold = float(obj.get('threshold', 0.5))
+                        loaded_feat_cols = obj.get('feat_cols', None)
+                        if 'classes' in obj:
+                            loaded_classes = list(obj['classes'])
                     else:
                         loaded_pipeline = obj
-                    print(f"✅ โหลดโมเดลสำเร็จจาก: {fname} (decision threshold = {loaded_threshold})")
+
+                    # ตรวจสอบ classes_ จากโมเดลจริงโดยตรง
+                    if hasattr(loaded_pipeline, 'classes_'):
+                        loaded_classes = list(loaded_pipeline.classes_)
+                    elif hasattr(loaded_pipeline, 'named_steps') and 'clf' in loaded_pipeline.named_steps:
+                        clf = loaded_pipeline.named_steps['clf']
+                        if hasattr(clf, 'classes_'):
+                            loaded_classes = list(clf.classes_)
+
+                    print(f"[OK] Model loaded from: {fname} (threshold={loaded_threshold}, classes={loaded_classes})")
                     return loaded_pipeline
                 except Exception as e:
-                    print(f"⚠️ ไม่สามารถโหลดโมเดลจาก {fname}: {e}")
+                    print(f"[WARN] Failed to load model from {fname}: {e}")
     return None
 
 # =============================================================
@@ -84,25 +136,18 @@ def remove_hair(img_rgb):
     return cv2.inpaint(img_rgb, hair_mask, 3, cv2.INPAINT_TELEA)
 
 # =============================================================
-# 2) Segmentation: แยกรอยโรคออกจากผิวหนังด้วย Otsu ตาม Colab
+# 2) Segmentation: ชดเชยแสง (flat-field) + Otsu ตาม Colab เป๊ะ
 # =============================================================
-def segment_lesion(img_rgb):
+def _otsu_pick(M, h, w):
+    """Otsu บนแผนที่ความเข้ม แล้วเลือก component ที่ใหญ่และอยู่ใกล้กลางภาพ (ตาม Colab ข้อ 2)"""
     if not OPENCV_AVAILABLE:
-        h, w = img_rgb.shape[:2]
-        mask = np.zeros((h, w), np.uint8)
-        cv2.circle(mask, (w // 2, h // 2), min(h, w) // 4, 255, -1)
-        return mask
-
-    h, w = img_rgb.shape[:2]
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    # รอยโรคเข้มกว่าผิว -> THRESH_BINARY_INV
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return None
+    M = cv2.GaussianBlur(M, (5, 5), 0)
+    M8 = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(M8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # เลือก component ที่ใหญ่และอยู่ใกล้กลางภาพ (ตัดขอบมืดของกล้อง)
     lab = label(mask > 0)
     best, best_score = None, -1
     for r in regionprops(lab):
@@ -112,16 +157,47 @@ def segment_lesion(img_rgb):
         score = r.area * (1 - dist) * (0.3 if touches_border else 1.0)
         if score > best_score:
             best, best_score = r.label, score
+    if best is None:
+        return None
+    mask = (lab == best).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(mask, cnts, -1, 255, -1)  # เติมรูภายใน
+    return mask
 
-    if best is None:  # ไม่พบรอยโรค -> ใช้วงกลมกลางภาพ
+def segment_lesion(img_rgb, iters=2, sigma=40):
+    """แยกรอยโรคแบบชดเชยแสงไม่สม่ำเสมอ (flat-field correction) ตาม Colab ข้อ 2 เป๊ะ
+    1) ประมาณแสงพื้นหลังด้วย Gaussian blur ขนาดใหญ่ แล้วหาส่วนที่มืดกว่าพื้นหลัง
+    2) ประมาณพื้นหลังใหม่จากผิวหนังเท่านั้น (ตัดรอยโรคออก) แล้วแยกซ้ำ 2 รอบ
+    """
+    if not OPENCV_AVAILABLE:
+        h, w = img_rgb.shape[:2]
+        y, x = np.ogrid[:h, :w]
+        dist = np.sqrt((x - w // 2) ** 2 + (y - h // 2) ** 2)
+        return ((dist <= min(h, w) // 4).astype(np.uint8) * 255)
+
+    h, w = img_rgb.shape[:2]
+    L = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32)
+    bg = cv2.GaussianBlur(L, (0, 0), sigma)
+    mask = _otsu_pick(bg - L, h, w)
+    for _ in range(iters):
+        if mask is None:
+            break
+        ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        skin = (cv2.dilate(mask, ring) == 0).astype(np.float32)
+        if skin.mean() < 0.05:  # รอยโรคเต็มภาพ ใช้ผลรอบก่อน
+            break
+        bg = (cv2.GaussianBlur(L * skin, (0, 0), sigma) /
+              (cv2.GaussianBlur(skin, (0, 0), sigma) + 1e-6))
+        new = _otsu_pick(bg - L, h, w)
+        if new is None:
+            break
+        mask = new
+
+    if mask is None:  # ไม่พบรอยโรค -> ใช้วงกลมกลางภาพ
         mask = np.zeros((h, w), np.uint8)
         cv2.circle(mask, (w // 2, h // 2), min(h, w) // 4, 255, -1)
         return mask
 
-    mask = (lab == best).astype(np.uint8) * 255
-    # เติมรูภายใน
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    cv2.drawContours(mask, cnts, -1, 255, -1)
     return mask
 
 # =============================================================
@@ -185,7 +261,7 @@ def border_diameter_features(mask):
         'B_extent': float(p.extent), # area / bbox area
         'D_area': float(area),
         'D_perimeter': float(perimeter),
-        'D_equiv_diameter': float(p.equivalent_diameter_area),
+        'D_equiv_diameter': float(getattr(p, 'equivalent_diameter_area', getattr(p, 'equivalent_diameter', 35.0))),
         'D_major_axis': float(p.axis_major_length if hasattr(p, 'axis_major_length') else p.major_axis_length),
         'D_minor_axis': float(p.axis_minor_length if hasattr(p, 'axis_minor_length') else p.minor_axis_length),
     }
@@ -244,12 +320,17 @@ def texture_features(img_rgb, mask):
         crop = gray[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
     crop_q = (crop // 4).astype(np.uint8) # ลดเป็น 64 ระดับเทา
-    glcm = graycomatrix(crop_q, distances=[1, 3],
-                        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
-                        levels=64, symmetric=True, normed=True)
+    glcm = graycomatrix(
+        crop_q,
+        distances=[1, 3],
+        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+        levels=64,
+        symmetric=True,
+        normed=True,
+    )
     feats = {}
-    for prop in ['contrast', 'dissimilarity', 'homogeneity',
-                 'energy', 'correlation', 'ASM']:
+    props = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
+    for prop in props:
         feats[f'T_glcm_{prop}'] = float(graycoprops(glcm, prop).mean())
 
     lbp = local_binary_pattern(gray, P=8, R=1, method='uniform')
@@ -363,6 +444,9 @@ async def predict(file: UploadFile = File(...)):
         return {
             "is_skin": True,
             "has_lesion": False,
+            "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
+            "confidence": 0.0,
+            "risk_level": "uncertain",
             "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ภาพอยู่นอกเหนือขอบเขตการคัดกรอง: ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะรอยโรคผิวหนัง (Malignant vs. Benign) ตามเล่มโครงงาน กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
         }
 
@@ -375,80 +459,64 @@ async def predict(file: UploadFile = File(...)):
     _, buffer = cv2.imencode('.jpg', cv2.cvtColor(show, cv2.COLOR_RGB2BGR))
     overlay_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
 
-    # ทำนายผลด้วย Pipeline ที่เทรนไว้ (ถ้ามีโมเดล .joblib หรือ .pkl)
+    # ทำนายผลด้วยโมเดล Pipeline ที่ฝึกไว้จริง (skin_cancer_pipeline.joblib)
     pipeline = get_trained_pipeline()
-    is_malignant = False
-    confidence = 88.0
-    prob_malignant = 0.0
+    if pipeline is None:
+        raise HTTPException(
+            status_code=500,
+            detail="ไม่พบไฟล์โมเดล AI (skin_cancer_pipeline.joblib) บนเซิร์ฟเวอร์ ระบบจำเป็นต้องใช้โมเดลจริงที่ฝึกไว้เท่านั้น"
+        )
 
-    if pipeline is not None:
-        try:
-            import pandas as pd
-            df_feat = pd.DataFrame([feats])
-            if hasattr(pipeline, "predict_proba"):
-                probs = pipeline.predict_proba(df_feat)[0]
-                prob_malignant = float(probs[1])
-                
-                # ใช้ Threshold พิเศษที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
-                is_malignant = (prob_malignant >= loaded_threshold)
-                
-                # คำนวณค่าความเชื่อมั่นตามคลาสที่ถูกตัดสินใจ
-                confidence = float((prob_malignant if is_malignant else probs[0]) * 100.0)
-            else:
-                pred = pipeline.predict(df_feat)[0]
-                is_malignant = (pred == 1)
-                prob_malignant = 1.0 if is_malignant else 0.0
-                confidence = 91.5
-        except Exception as e:
-            print(f"Prediction fallback due to: {e}")
-            # ใช้การคำนวณตามเกณฑ์ ABCD ทางคลินิก (TDV Score) เป็น Fallback
-            asym = feats.get('A_asym_mean', 0.2)
-            comp = feats.get('B_compactness', 1.0)
-            n_colors = feats.get('C_n_colors', 1)
-            contrast = feats.get('C_contrast_to_skin', 10.0)
-            diam = feats.get('D_equiv_diameter', 40.0)
+    try:
+        import pandas as pd
+        # 1. เลือกฟีเจอร์และเรียงคอลัมน์ให้ตรงกับตอนเทรนโมเดลใน Colab 100%
+        active_feat_cols = loaded_feat_cols if (loaded_feat_cols and len(loaded_feat_cols) > 0) else DEFAULT_FEAT_COLS
+        df_feat = pd.DataFrame([feats])
+        for col in active_feat_cols:
+            if col not in df_feat.columns:
+                df_feat[col] = 0.0
+        df_feat = df_feat[active_feat_cols]
+        # ล้างค่า NaN และ Infinity ที่อาจเกิดจากการคำนวณทางสถิติ เพื่อไม่ให้โมเดล Error
+        df_feat = df_feat.fillna(0.0).replace([np.inf, -np.inf], 0.0)
+
+        # 2. ค้นหาตำแหน่ง index ของคลาส malignant ใน classes_ ของโมเดลจริง
+        malignant_idx = 1
+        for i, c in enumerate(loaded_classes):
+            if c == 1 or str(c).lower() in ('1', 'malignant', 'melanoma'):
+                malignant_idx = i
+                break
+
+        benign_idx = 0 if malignant_idx != 0 else 1
+
+        # 3. ส่งข้อมูลเข้าโมเดลโดยตรง
+        if hasattr(pipeline, "predict_proba"):
+            probs = pipeline.predict_proba(df_feat.values)[0]
+            prob_malignant = float(probs[malignant_idx])
             
-            # คะแนนความเสี่ยงมะเร็งผิวหนัง (ABCD Risk Index)
-            risk_score = (asym * 2.5) + ((comp - 1.0) * 0.8) + (n_colors * 0.4) + (contrast * 0.02)
-            is_malignant = (risk_score > 1.85)
-            confidence = min(98.5, max(75.0, 70.0 + (abs(risk_score - 1.85) * 18.0)))
+            # ใช้ Decision Threshold ที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
+            is_malignant = (prob_malignant >= loaded_threshold)
+            
+            # คำนวณค่าความเชื่อมั่นตามคลาสที่โมเดลตัดสินใจจริง
+            confidence = float((prob_malignant if is_malignant else probs[benign_idx]) * 100.0)
+        else:
+            pred = pipeline.predict(df_feat.values)[0]
+            is_malignant = (pred == loaded_classes[malignant_idx])
+            prob_malignant = 1.0 if is_malignant else 0.0
+            confidence = 100.0
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"โมเดลไม่สามารถประมวลผลการจำแนกได้: {str(e)}"
+        )
+
+    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 60%)
+    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 60% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
+    is_uncertain = (confidence < 60.0)
+    if is_uncertain:
+        disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ (Uncertain)"
+        risk_level = "uncertain"
+        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ 60% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
     else:
-        # กรณีรันโดยยังไม่ได้วางไฟล์ skin_cancer_pipeline.joblib
-        # คำนวณความเสี่ยงด้วยเกณฑ์ ABCD + Texture โดยตรง
-        asym = feats.get('A_asym_mean', 0.2)
-        comp = feats.get('B_compactness', 1.0)
-        n_colors = feats.get('C_n_colors', 1)
-        contrast = feats.get('C_contrast_to_skin', 10.0)
-        texture_glcm = feats.get('T_glcm_contrast', 5.0)
-
-        risk_score = (asym * 2.5) + ((comp - 1.0) * 0.8) + (n_colors * 0.4) + (contrast * 0.02)
-        is_malignant = (risk_score > 1.85)
-        confidence = min(98.2, max(76.0, 72.0 + (abs(risk_score - 1.85) * 16.0)))
-
-    # Guardrail: ตรวจจับว่าเป็นภาพบุคคล/ใบหน้า/มุมกว้าง หรือไม่ (Portrait / Wide-Area Guardrail)
-    # ป้องกันไม่ให้อาจารย์หรือผู้ใช้ที่ถ่ายภาพหน้าตัวเองถูกวินิจฉัยคลาดเคลื่อนเป็นมะเร็งผิวหนังเนื่องจากเส้นผม/ดวงตา
-    is_wide_portrait = False
-    m_props = regionprops((mask > 0).astype(np.uint8))
-    if m_props:
-        p0 = m_props[0]
-        min_r, min_c, max_r, max_c = p0.bbox
-        touches_top = (min_r <= 1)
-        touches_bottom = (max_r >= 223)
-        touches_left = (min_c <= 1)
-        touches_right = (max_c >= 223)
-        area_ratio = float(p0.area) / (224.0 * 224.0)
-        # รอยโรคแตะขอบบน-ล่างพร้อมกัน (เช่น ผมบนหัว กับ ปกเสื้อ) หรือครอบคลุมพื้นที่กว้าง > 35%
-        if (touches_top and touches_bottom) or (touches_left and touches_right) or (area_ratio > 0.35):
-            is_wide_portrait = True
-
-    if is_wide_portrait and is_malignant:
-        is_malignant = False
-        confidence = 94.2
-        disease_name = "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
-        risk_level = "low"
-        message = "วิเคราะห์ภาพบุคคล/มุมกว้าง ระบบคัดกรองเบื้องต้นไม่พบรอยโรคเนื้อร้ายที่มีความเสี่ยง แนะนำให้ถ่ายภาพระยะประชิด 10-15 ซม. เจาะจงเฉพาะจุดรอยโรคค่ะ"
-    else:
-        # ข้อมูลสรุปผลจำแนก
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"
         message = (
@@ -456,7 +524,6 @@ async def predict(file: UploadFile = File(...)):
             if is_malignant else
             "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
         )
-
 
     asym_val = feats.get('A_asym_mean', 0.0)
     comp_val = feats.get('B_compactness', 1.0)
@@ -466,6 +533,7 @@ async def predict(file: UploadFile = File(...)):
 
     return {
         "is_skin": True,
+        "is_uncertain": is_uncertain,
         "predicted_disease": disease_name,
         "confidence": round(confidence, 1),
         "risk_level": risk_level,
