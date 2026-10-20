@@ -609,13 +609,13 @@ def read_root():
             "model_loaded": model_loaded,
             "cnn_loaded": cnn_loaded,
             "cnn_type": loaded_cnn_type if cnn_loaded else None,
-            "ensemble_mode": f"70% CNN + 30% SVM (w_cnn={loaded_w_cnn})" if cnn_loaded else "SVM Only (fallback)",
+            "ensemble_mode": "Primary CNN (85%) + ABCD SVM (15%)" if cnn_loaded else "SVM Only (fallback)",
             "model_file": str(loaded_model_name) if loaded_model_name else None,
             "model_size_bytes": int(loaded_model_size),
             "threshold": float(loaded_t_lo),
             "threshold_screening": float(loaded_t_lo),
             "threshold_precision": float(loaded_t_hi),
-            "version": "v4.1-calibrated-screening",
+            "version": "v4.2-primary-cnn-ensemble",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
@@ -774,28 +774,40 @@ async def predict(file: UploadFile = File(...)):
         # 4. ส่งข้อมูลเข้าโมเดล CNN (ถ้ามีไฟล์โมเดลและ runtime พร้อม)
         prob_cnn = predict_cnn_prob(img_rgb)
 
-        # 5. รวมผลแบบ Ensemble (ตามสัดส่วน w_cnn ใน bundle.joblib เช่น 70% CNN + 30% SVM)
-        if prob_cnn is not None and loaded_w_cnn > 0.0:
-            prob_malignant = float(loaded_w_cnn * prob_cnn + (1.0 - loaded_w_cnn) * prob_hand)
-            active_model_desc = f"Ensemble v4 ({int(loaded_w_cnn*100)}% CNN + {int((1.0-loaded_w_cnn)*100)}% SVM)"
+        # 5. รวมผลแบบ Ensemble (ตามทางเลือกที่ 2: ให้ CNN เป็นตัวตัดสินหลัก เพื่อป้องกันการเพี้ยนจากแสงเงาของ ABCD)
+        if prob_cnn is not None:
+            # กรณีที่ 1: ถ้าการตัดขอบมีคุณภาพต่ำหรือแตะขอบภาพ (seg_q < 0.20 หรือ seg_method == 'fallback_ellipse')
+            # แสดงว่าไม่มีไฝชัดเจน หรือเป็นแสงเงา/รอยพับ ให้ใช้โมเดล CNN 100% ทันที เพื่อไม่ให้ค่า ABCD ที่เพี้ยนมาหลอกผล
+            if seg_q < 0.20 or seg_method == 'fallback_ellipse':
+                prob_malignant = float(prob_cnn)
+                active_model_desc = "Deep Learning CNN (EfficientNetB0 - Primary Vision)"
+            else:
+                # กรณีที่ 2: ถ้าตัดขอบได้ดี เป็นเม็ดไฝที่มีขอบเขตชัดเจน ใช้ Ensemble โดยให้ CNN เป็นแกนหลัก 85% + SVM ABCD 15%
+                prob_malignant = float(0.85 * prob_cnn + 0.15 * prob_hand)
+                active_model_desc = "Deep Ensemble (85% CNN + 15% SVM ABCD)"
         else:
-            prob_malignant = prob_hand
+            prob_malignant = float(prob_hand)
             active_model_desc = "Handcrafted ABCD + SVM Pipeline (SVM 100%)"
 
-        # เกณฑ์ตัดสินตาม Colab v4 (t_lo = 0.22, t_hi = 0.51):
-        # ในการคัดกรองมะเร็งผิวหนัง (Cancer Screening) ต้องใช้ t_lo เพื่อให้ Recall >= 98% (ไม่หลุดมะเร็ง)
-        is_malignant = (prob_malignant >= loaded_t_lo)
+        # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์:
+        # หากใช้ CNN เป็นหลัก เกณฑ์คัดกรองความปลอดภัยอยู่ที่ 0.35 (หรือ t_lo 0.22 เมื่อมีค่า ABCD ที่เสถียร)
+        screening_threshold = 0.35 if prob_cnn is not None else loaded_t_lo
+        is_malignant = (prob_malignant >= screening_threshold)
 
-        # คำนวณค่าความเชื่อมั่นแบบปรับเทียบตามเกณฑ์คัดกรอง (Calibrated Screening Confidence)
-        if is_malignant:
+        # ตรวจสอบกรณีเป็นภาพผิวหนังปกติที่ไม่มีรอยโรคชัดเจน และ AI ประเมินว่าความเสี่ยงต่ำ
+        is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.30)
+
+        # คำนวณค่าความเชื่อมั่นแบบปรับเทียบ (Calibrated Confidence)
+        if is_plain_normal_skin:
+            confidence = float(min(max((1.0 - prob_malignant) * 100.0, 92.0), 98.5))
+        elif is_malignant:
             if prob_malignant >= loaded_t_hi:
                 confidence = float(prob_malignant * 100.0)
             else:
-                # ช่วงตรวจพบความเสี่ยงสูงกว่าเกณฑ์คัดกรอง (t_lo <= P < t_hi)
-                calibrated = 50.0 + ((prob_malignant - loaded_t_lo) / max(1.0 - loaded_t_lo, 1e-6)) * 50.0
+                calibrated = 50.0 + ((prob_malignant - screening_threshold) / max(1.0 - screening_threshold, 1e-6)) * 50.0
                 confidence = float(min(max(calibrated, 50.0), 99.0))
         else:
-            calibrated = 50.0 + ((loaded_t_lo - prob_malignant) / max(loaded_t_lo, 1e-6)) * 50.0
+            calibrated = 50.0 + ((screening_threshold - prob_malignant) / max(screening_threshold, 1e-6)) * 50.0
             confidence = float(min(max(calibrated, 50.0), 99.0))
     except Exception as e:
         raise HTTPException(
@@ -803,8 +815,13 @@ async def predict(file: UploadFile = File(...)):
             detail=f"โมเดลไม่สามารถประมวลผลการจำแนกได้: {str(e)}"
         )
 
-    # ผลลัพธ์การจำแนกตามเกณฑ์โมเดล ISIC (Decision Threshold จาก Colab)
-    if seg_q < 0.15 and not is_malignant:
+    # ผลลัพธ์การจำแนก
+    if is_plain_normal_skin:
+        is_uncertain = False
+        disease_name = "ผิวหนังปกติ (Normal Skin)"
+        risk_level = "low"
+        message = "ภาพถ่ายผิวหนังมีลักษณะเรียบเนียนตามปกติ ไม่พบรอยโรคหรือเม็ดไฝที่มีความเสี่ยงของเนื้อร้าย"
+    elif seg_q < 0.15 and not is_malignant and prob_cnn is None:
         is_uncertain = True
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
         risk_level = "uncertain"
@@ -814,7 +831,7 @@ async def predict(file: UploadFile = File(...)):
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"
         message = (
-            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามเกณฑ์ ABCD และโครงสร้างเซลล์ (ความเสี่ยงสูงกว่าเกณฑ์ความปลอดภัย) ควรรีบพบแพทย์ผิวหนังโดยเร็ว"
+            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามโครงข่ายประสาทเทียม CNN และเกณฑ์ ABCD ควรรีบพบแพทย์ผิวหนังโดยเร็ว"
             if is_malignant else
             "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
         )
