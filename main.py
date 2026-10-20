@@ -173,8 +173,14 @@ def predict_cnn_prob(img_rgb):
             preds = cnn.get_tensor(output_details[0]['index'])
             return float(preds[0][0])
         elif loaded_cnn_type == 'keras':
-            preds = loaded_cnn.predict(x, verbose=0)
-            return float(preds[0][0])
+            try:
+                preds = loaded_cnn(x, training=False)
+                if hasattr(preds, 'numpy'):
+                    return float(preds.numpy()[0][0])
+                return float(preds[0][0])
+            except Exception:
+                preds = loaded_cnn.predict(x, verbose=0)
+                return float(preds[0][0])
     except Exception as e:
         print(f"[WARN] CNN prediction failed: {e}")
         return None
