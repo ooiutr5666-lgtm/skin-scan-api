@@ -160,15 +160,10 @@ def segment_lesion(img_rgb, return_info=False):
     mask, q = None, 0.0
     if cands:
         q, method, mask = max(cands, key=lambda t: t[0])
-    if mask is None or q < MIN_QUALITY:
-        g = _grabcut(img_rgb)
-        gq = _quality(g) if g is not None else 0.0
-        if g is not None and gq > q:
-            mask, q, method = g, gq, 'grabcut'
-    if mask is None or q < 0.02:                          # สุดท้ายจริง ๆ: วงรีกลางภาพ
+    if mask is None or q < 0.02:
         mask = np.zeros((h, w), np.uint8)
         cv2.ellipse(mask, (w // 2, h // 2), (w // 5, h // 5), 0, 0, 360, 255, -1)
-        method, q = 'fallback_ellipse', 0.0
+        method, q = 'fallback_ellipse', 0.05
     return (mask, {'method': method, 'quality': q}) if return_info else mask
 
 
