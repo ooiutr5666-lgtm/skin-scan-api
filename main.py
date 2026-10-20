@@ -24,6 +24,12 @@ try:
 except ImportError:
     JOBLIB_AVAILABLE = False
 
+try:
+    import features
+    FEATURES_MODULE_AVAILABLE = True
+except ImportError:
+    FEATURES_MODULE_AVAILABLE = False
+
 app = FastAPI(
     title="Skin Lesion Classifier API (Skin Cancer: Malignant vs. Benign)",
     description="API สำหรับคัดกรองมะเร็งผิวหนังด้วยโมเดล ABCD Handcrafted Features + SVM/Deep Learning (ISIC/Kaggle)"
@@ -454,25 +460,28 @@ async def predict(file: UploadFile = File(...)):
         }
 
     # สกัด Features 58 ตัว + รอยโรคที่แบ่งส่วนได้ตามสูตรโครงงาน
-    feats, mask, cleaned = extract_handcrafted(img_rgb)
+    if FEATURES_MODULE_AVAILABLE:
+        cleaned = features.remove_hair(img_rgb)
+        mask, info = features.segment_lesion(cleaned, return_info=True)
+        seg_q = float(info.get('quality', 1.0))
+        seg_method = str(info.get('method', ''))
+        feats = {}
+        feats.update(features.asymmetry_features(mask))
+        feats.update(features.border_diameter_features(mask))
+        feats.update(features.color_features(cleaned, mask))
+        feats.update(features.texture_features(cleaned, mask))
+    else:
+        feats, mask, cleaned = extract_handcrafted(img_rgb)
+        seg_q = 1.0
+        seg_method = 'legacy'
 
     # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check)
-    # ไม่แตะต้องโมเดล SVM แต่ป้องกันไม่ให้ภาพผิวปกติเรียบเนียนถูกวิเคราะห์ผิด
     inside = mask > 0
     outside = ~inside
-    has_lesion = True
+    total_px = float(mask.shape[0] * mask.shape[1])
+    lesion_ratio = float(inside.sum()) / total_px
 
-    if inside.sum() < (224 * 224 * 0.005) or outside.sum() < (224 * 224 * 0.05):
-        has_lesion = False
-    else:
-        gray = cv2.cvtColor(cleaned, cv2.COLOR_RGB2GRAY)
-        lum_diff = float(gray[outside].mean() - gray[inside].mean())
-        contrast = feats.get('C_contrast_to_skin', 0.0)
-        # หากความเข้มไม่ต่างจากผิว (< 7) และสีไม่ต่างจากผิวรอบข้าง (< 12.0) ถือเป็นผิวปกติ
-        if lum_diff < 7.0 and contrast < 12.0:
-            has_lesion = False
-
-    if not has_lesion:
+    if inside.sum() < (224 * 224 * 0.005) or outside.sum() < (224 * 224 * 0.05) or (FEATURES_MODULE_AVAILABLE and seg_q < 0.03):
         return {
             "is_skin": True,
             "has_lesion": False,
@@ -483,15 +492,15 @@ async def predict(file: UploadFile = File(...)):
         }
 
     # ด่านตรวจภาพนอกขอบเขตโมเดล (Out-of-Scope Guard)
-    # โมเดลเทรนจากภาพรอยโรคระยะประชิด (ISIC) รอยโรคต้องมีขนาดพอสมควรและไม่เต็มทั้งเฟรม
-    # ภาพใบหน้า/มุมกว้างที่ไฝเป็นจุดเล็กๆ หรือ segmentation ได้ทั้งเฟรม จึงไม่ควรส่งให้โมเดลทำนาย
-    total_px = float(mask.shape[0] * mask.shape[1])
-    lesion_ratio = float(inside.sum()) / total_px
     ys, xs = np.where(inside)
     borders_touched = int(ys.min() == 0) + int(ys.max() == mask.shape[0] - 1) + \
         int(xs.min() == 0) + int(xs.max() == mask.shape[1] - 1)
-    out_of_scope = (lesion_ratio < 0.015) or (lesion_ratio > 0.75) or \
-        (borders_touched >= 3 and lesion_ratio > 0.45)
+
+    out_of_scope = (lesion_ratio < 0.015) or (lesion_ratio > 0.70) or \
+        (borders_touched >= 2 and lesion_ratio > 0.18) or \
+        (borders_touched >= 3) or \
+        (FEATURES_MODULE_AVAILABLE and seg_q < 0.06 and seg_method == 'fallback_ellipse')
+
     if out_of_scope:
         return {
             "is_skin": True,
@@ -500,7 +509,7 @@ async def predict(file: UploadFile = File(...)):
             "confidence": 0.0,
             "risk_level": "uncertain",
             "lesion_area_ratio": round(lesion_ratio, 4),
-            "message": "ภาพนี้อยู่นอกเหนือขอบเขตของโมเดล (เช่น ภาพใบหน้า/ภาพมุมกว้าง หรือรอยโรคเล็ก/ใหญ่เกินกรอบ) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด กรุณาถ่ายระยะประชิด 10–15 ซม. ให้เห็นไฝหรือรอยโรคเต็มกรอบค่ะ",
+            "message": "ภาพนี้อยู่นอกเหนือขอบเขตของโมเดล (รอยโรคไม่อยู่กึ่งกลางภาพ ชิดขอบ หรือเป็นรอยปื้นกว้าง) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด กรุณาถ่ายระยะประชิด 10–15 ซม. โดยจัดให้ไฝหรือรอยโรคอยู่ตรงกลางภาพค่ะ",
             "gradcam_image": None
         }
 
@@ -585,13 +594,13 @@ async def predict(file: UploadFile = File(...)):
             detail=f"โมเดลไม่สามารถประมวลผลการจำแนกได้: {str(e)}"
         )
 
-    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 60%)
-    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 60% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
-    is_uncertain = (confidence < 60.0)
+    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 65%)
+    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 65% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
+    is_uncertain = (confidence < 65.0)
     if is_uncertain:
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ (Uncertain)"
         risk_level = "uncertain"
-        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ 60% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
+        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย 65% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
     else:
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"
