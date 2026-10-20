@@ -101,20 +101,28 @@ loaded_w_cnn = 0.0
 loaded_t_lo = 0.22
 loaded_t_hi = 0.51
 
+loaded_cnn_error = None
+
 def get_trained_cnn():
-    global loaded_cnn, loaded_cnn_type
+    global loaded_cnn, loaded_cnn_type, loaded_cnn_error
     if loaded_cnn is not None:
         return loaded_cnn
     
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     cnn_candidates = [
+        (os.path.join(base_dir, 'cnn.onnx'), 'onnx'),
         ('cnn.onnx', 'onnx'),
+        (os.path.join(base_dir, 'model.onnx'), 'onnx'),
         ('model.onnx', 'onnx'),
+        (os.path.join(base_dir, 'cnn.tflite'), 'tflite'),
         ('cnn.tflite', 'tflite'),
-        ('model.tflite', 'tflite'),
+        (os.path.join(base_dir, 'cnn.keras'), 'keras'),
         ('cnn.keras', 'keras'),
-        ('model.keras', 'keras'),
-        ('cnn.h5', 'keras'),
     ]
+    for f in glob.glob(os.path.join(base_dir, "*.onnx")) + glob.glob("*.onnx"):
+        if (f, 'onnx') not in cnn_candidates:
+            cnn_candidates.append((f, 'onnx'))
+
     for cpath, ctype in cnn_candidates:
         if os.path.exists(cpath):
             try:
@@ -122,6 +130,7 @@ def get_trained_cnn():
                     import onnxruntime as ort
                     loaded_cnn = ort.InferenceSession(cpath, providers=['CPUExecutionProvider'])
                     loaded_cnn_type = 'onnx'
+                    loaded_cnn_error = None
                     print(f"[OK] CNN Loaded via ONNX Runtime: {cpath}")
                     return loaded_cnn
                 elif ctype == 'tflite':
@@ -133,6 +142,7 @@ def get_trained_cnn():
                     interpreter.allocate_tensors()
                     loaded_cnn = interpreter
                     loaded_cnn_type = 'tflite'
+                    loaded_cnn_error = None
                     print(f"[OK] CNN Loaded via TFLite: {cpath}")
                     return loaded_cnn
                 elif ctype == 'keras':
@@ -140,16 +150,21 @@ def get_trained_cnn():
                         import tensorflow as tf
                         loaded_cnn = tf.keras.models.load_model(cpath, compile=False)
                         loaded_cnn_type = 'keras'
+                        loaded_cnn_error = None
                         print(f"[OK] CNN Loaded via Keras/TensorFlow: {cpath}")
                         return loaded_cnn
                     except ImportError:
                         import keras
                         loaded_cnn = keras.models.load_model(cpath, compile=False)
                         loaded_cnn_type = 'keras'
+                        loaded_cnn_error = None
                         print(f"[OK] CNN Loaded via Keras: {cpath}")
                         return loaded_cnn
             except Exception as e:
+                loaded_cnn_error = f"{type(e).__name__}: {str(e)}"
                 print(f"[WARN] Failed to load CNN {cpath}: {e}")
+    if loaded_cnn_error is None:
+        loaded_cnn_error = f"No CNN file found in {base_dir} (files={os.listdir(base_dir)})"
     return None
 
 def predict_cnn_prob(img_rgb):
@@ -600,6 +615,7 @@ def read_root():
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
+            "cnn_status_note": loaded_cnn_error,
             "criteria": "Ensemble v4: Deep Learning (EfficientNetB0) + Handcrafted ABCD/Texture"
         }
     except Exception as e:
