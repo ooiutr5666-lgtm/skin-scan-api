@@ -85,9 +85,11 @@ loaded_threshold = 0.5  # กำหนดค่าสำรองเริ่ม
 loaded_feat_cols = None
 loaded_classes = [0, 1]
 loaded_ood = None  # ตัวตรวจภาพนอกขอบเขต (Mahalanobis) จาก Colab ถ้ามี
+loaded_model_name = None
+loaded_model_size = 0
 
 def get_trained_pipeline():
-    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes, loaded_ood
+    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes, loaded_ood, loaded_model_name, loaded_model_size
     if loaded_pipeline is not None:
         return loaded_pipeline
     if JOBLIB_AVAILABLE:
@@ -111,6 +113,9 @@ def get_trained_pipeline():
                     else:
                         loaded_pipeline = obj
 
+                    loaded_model_name = fname
+                    loaded_model_size = os.path.getsize(fname)
+
                     # ตรวจสอบ classes_ จากโมเดลจริงโดยตรง
                     if hasattr(loaded_pipeline, 'classes_'):
                         loaded_classes = list(loaded_pipeline.classes_)
@@ -119,7 +124,7 @@ def get_trained_pipeline():
                         if hasattr(clf, 'classes_'):
                             loaded_classes = list(clf.classes_)
 
-                    print(f"[OK] Model loaded from: {fname} (threshold={loaded_threshold}, classes={loaded_classes})")
+                    print(f"[OK] Model loaded from: {fname} (size={loaded_model_size}, threshold={loaded_threshold}, classes={loaded_classes})")
                     return loaded_pipeline
                 except Exception as e:
                     print(f"[WARN] Failed to load model from {fname}: {e}")
@@ -397,8 +402,12 @@ def read_root():
     return {
         "status": "online",
         "project": "Skin Cancer: Malignant vs. Benign (ISIC/Kaggle)",
-        "classes": ["Benign (ไฝปกติ/ไม่พบเนื้อร้าย)", "Malignant (เสี่ยงมะเร็งผิวหนัง)"],
         "model_loaded": model_loaded,
+        "model_file": loaded_model_name,
+        "model_size_bytes": loaded_model_size,
+        "threshold": loaded_threshold,
+        "has_ood_guard": (loaded_ood is not None),
+        "classes": loaded_classes,
         "features_count": 58,
         "criteria": "Handcrafted ABCD + Texture (Asymmetry, Border, Color, Diameter, GLCM/LBP)"
     }
