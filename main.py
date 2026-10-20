@@ -89,7 +89,7 @@ DEFAULT_FEAT_COLS = [
 ]
 
 loaded_pipeline = None
-loaded_threshold = 0.5  # กำหนดค่าสำรองเริ่มต้น (Default Fallback Threshold)
+loaded_threshold = 0.22  # เกณฑ์คัดกรองมะเร็งผิวหนัง (Recall >= 98%) ตาม Colab v4 (t_lo)
 loaded_feat_cols = None
 loaded_classes = [0, 1]
 loaded_ood = None  # ตัวตรวจภาพนอกขอบเขต (Mahalanobis) จาก Colab ถ้ามี
@@ -612,7 +612,10 @@ def read_root():
             "ensemble_mode": f"70% CNN + 30% SVM (w_cnn={loaded_w_cnn})" if cnn_loaded else "SVM Only (fallback)",
             "model_file": str(loaded_model_name) if loaded_model_name else None,
             "model_size_bytes": int(loaded_model_size),
-            "threshold": thr_clean,
+            "threshold": float(loaded_t_lo),
+            "threshold_screening": float(loaded_t_lo),
+            "threshold_precision": float(loaded_t_hi),
+            "version": "v4.1-calibrated-screening",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
