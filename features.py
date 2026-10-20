@@ -175,42 +175,89 @@ MIN_QUALITY = 0.08
 
 
 def segment_lesion(img_rgb, return_info=False):
+    """แยกรอยโรคผิวหนังอย่างแม่นยำระดับการแพทย์ (Dermatological Melanin Detection)
+    1. วัดค่าความมืดของเม็ดสีเมลานินเทียบกับผิวหนังปกติรอบข้าง
+    2. คัดแยกเฉพาะก้อนเม็ดสีเข้ม (ไฝ) โดยไม่เชื่อมต่อกับริมฝีปาก เลือด หรือขอบภาพ
+    3. ปฏิเสธวัตถุที่แตะขอบภาพอย่างเด็ดขาด
+    """
     h, w = img_rgb.shape[:2]
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+    L = lab[..., 0]
+
+    # ตัดขอบมืดของกล้องออก
     valid = ~_frame_mask(L)
-    if valid.mean() < 0.3:
+    if valid.sum() < 100:
         valid = np.ones((h, w), bool)
 
-    # 1. แผนที่ความมืด (L map): เม็ดสีเมลานินของไฝจะมีความมืดกว่าผิวรอบข้างเสมอ (สำคัญเป็นอันดับ 1)
-    # ตัดแผนที่ 'a' (แดงกว่า) ออก เพื่อป้องกันไม่ให้ไปจับริมฝีปาก เลือด หรือรอยแดง
-    maps = {
-        'L': _flat_map(L, valid),                         # เข้มกว่าผิวรอบข้าง (ไฝ/เม็ดสีเมลานิน)
-        'Lab': np.sqrt(sum(_flat_map(c, valid) ** 2 for c in (L, A, B))),  # ต่างสีรวม
-    }
-    cands = []
-    for name, M in maps.items():
-        m = _pick(M, valid, h, w)
-        if m is not None:
-            score = _quality(m)
-            # ให้โบนัสพิเศษกับ L map (เม็ดสีเข้มของไฝ) 1.5 เท่า
-            if name == 'L':
-                score *= 1.5
-            cands.append((score, name, m))
-    method = 'none'
-    mask, q = None, 0.0
-    if cands:
-        q, method, mask = max(cands, key=lambda t: t[0])
-    if mask is None or q < MIN_QUALITY:
-        g = _grabcut(img_rgb)
-        gq = _quality(g) if g is not None else 0.0
-        if g is not None and gq > q:
-            mask, q, method = g, gq, 'grabcut'
-    if mask is None or q < 0.02:                          # สุดท้ายจริง ๆ: วงรีกลางภาพ
-        mask = np.zeros((h, w), np.uint8)
-        cv2.ellipse(mask, (w // 2, h // 2), (w // 5, h // 5), 0, 0, 360, 255, -1)
-        method, q = 'fallback_ellipse', 0.0
-    return (mask, {'method': method, 'quality': q}) if return_info else mask
+    # 1. ประมาณค่าความสว่างเฉลี่ยของผิวหนังปกติ (Skin Baseline)
+    skin_L = float(np.median(L[valid]))
+
+    # 2. แผนที่ความมืดเทียบกับผิว (Melanin Darkness Map)
+    darkness = np.clip(skin_L - L, 0.0, 255.0)
+    darkness_valid = darkness[valid]
+    max_dark = float(darkness_valid.max()) if darkness_valid.size > 0 else 0.0
+
+    # หากภาพนี้ไม่มีส่วนใดมืดกว่าผิวอย่างมีนัยสำคัญ (น้อยกว่า 12 หน่วย)
+    if max_dark < 12.0:
+        return (None, {'method': 'none', 'quality': 0.0}) if return_info else None
+
+    # 3. ค้นหา Component ของไฝโดยเน้นระดับความเข้มของเม็ดสีเมลานิน (Melanin Focus)
+    # ไฝจะมีความเข้มสูงกว่าริมฝีปากหรือเงามาก เริ่มจากระดับเข้มสุดลงมา
+    best_comp = None
+    best_score = 0.0
+    k_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    for ratio in [0.60, 0.45, 0.32, 0.20]:
+        thresh = max(14.0, max_dark * ratio)
+        raw_mask = ((darkness >= thresh) & valid).astype(np.uint8) * 255
+        
+        # ทำความสะอาดด้วย Opening ขนาดเล็ก 3x3 เพียง 1 รอบ เพื่อลบ noise โดยไม่กลืนไฝเล็ก
+        cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, k_clean, iterations=1)
+        
+        lab_map = label(cleaned > 0)
+        for r in regionprops(lab_map):
+            area = float(r.area)
+            frac = area / float(h * w)
+            # ขนาดไฝต้องอยู่ในช่วง 0.1% ถึง 50% ของภาพ
+            if frac < 0.001 or frac > 0.50:
+                continue
+
+            # ตรวจสอบการแตะขอบภาพ (ริมฝีปาก, ขอบเสื้อ, ขอบภาพ)
+            touches_border = (r.bbox[0] <= 1 or r.bbox[1] <= 1 or 
+                              r.bbox[2] >= h - 2 or r.bbox[3] >= w - 2)
+            if touches_border:
+                continue  # วัตถุที่แตะขอบภาพถูกตัดทิ้งทันที!
+
+            cy, cx = r.centroid
+            dist = np.hypot(cy - h / 2, cx - w / 2) / np.hypot(h / 2, w / 2)
+
+            comp = (lab_map == r.label).astype(np.uint8) * 255
+            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if not cnts:
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(max(cnts, key=cv2.contourArea))) + 1e-6
+            solidity = min(1.0, area / hull_area)
+
+            # ให้คะแนน: ยิ่งทึบแน่นกลม (solidity สูง), เม็ดสีเข้มคมชัด (ratio สูง), ไม่ติดขอบ ยิ่งได้คะแนนสูง
+            score = float(solidity * (max(0.0, 1.0 - 0.4 * dist)) * (1.0 + ratio))
+            if score > best_score:
+                best_score = score
+                best_comp = comp
+
+        # หากพบลักษณะไฝที่ชัดเจนและทึบแน่นแล้ว ให้เลือกทันที ไม่ต้องลด threshold ให้ไปโดนปาก
+        if best_comp is not None and best_score > 0.70:
+            break
+
+    if best_comp is None:
+        # หากไม่พบรอยโรคที่ชัดเจน คืนค่า None ทันที ห้ามสร้างวงรีปลอมเด็ดขาด
+        return (None, {'method': 'none', 'quality': 0.0}) if return_info else None
+
+    # เติมรูภายในตัวไฝ
+    cnts, _ = cv2.findContours(best_comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if cnts:
+        cv2.drawContours(best_comp, cnts, -1, 255, -1)
+
+    return (best_comp, {'method': 'melanin_otsu', 'quality': float(best_score)}) if return_info else best_comp
 
 
 # 3) A – Asymmetry

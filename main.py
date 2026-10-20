@@ -223,10 +223,8 @@ def segment_lesion(img_rgb, iters=2, sigma=40):
             break
         mask = new
 
-    if mask is None:  # ไม่พบรอยโรค -> ใช้วงกลมกลางภาพ
-        mask = np.zeros((h, w), np.uint8)
-        cv2.circle(mask, (w // 2, h // 2), min(h, w) // 4, 255, -1)
-        return mask
+    if mask is None:
+        return None
 
     return mask
 
@@ -532,15 +530,41 @@ async def predict(file: UploadFile = File(...)):
     if FEATURES_MODULE_AVAILABLE:
         cleaned = features.remove_hair(img_rgb)
         mask, info = features.segment_lesion(cleaned, return_info=True)
-        seg_q = float(info.get('quality', 1.0))
-        seg_method = str(info.get('method', ''))
+        seg_q = float(info.get('quality', 1.0)) if info else 0.0
+        seg_method = str(info.get('method', '')) if info else 'none'
+        if mask is None or mask.sum() == 0:
+            return {
+                "is_skin": True,
+                "has_lesion": False,
+                "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
+                "confidence": 0.0,
+                "risk_level": "uncertain",
+                "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ระบบไม่สามารถระบุขอบเขตของไฝได้อย่างชัดเจน เพื่อความปลอดภัยทางการแพทย์จึงไม่เดาสุ่มผล กรุณาถ่ายภาพระยะประชิด 10–15 ซม. โดยจัดให้ไฝอยู่ตรงกลางภาพค่ะ",
+                "gradcam_image": None
+            }
         feats = {}
         feats.update(features.asymmetry_features(mask))
         feats.update(features.border_diameter_features(mask))
         feats.update(features.color_features(cleaned, mask))
         feats.update(features.texture_features(cleaned, mask))
     else:
-        feats, mask, cleaned = extract_handcrafted(img_rgb)
+        cleaned = remove_hair(img_rgb)
+        mask = segment_lesion(cleaned)
+        if mask is None or mask.sum() == 0:
+            return {
+                "is_skin": True,
+                "has_lesion": False,
+                "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
+                "confidence": 0.0,
+                "risk_level": "uncertain",
+                "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ระบบไม่สามารถระบุขอบเขตของไฝได้อย่างชัดเจน เพื่อความปลอดภัยทางการแพทย์จึงไม่เดาสุ่มผล กรุณาถ่ายภาพระยะประชิด 10–15 ซม. โดยจัดให้ไฝอยู่ตรงกลางภาพค่ะ",
+                "gradcam_image": None
+            }
+        feats = {}
+        feats.update(asymmetry_features(mask))
+        feats.update(border_diameter_features(mask))
+        feats.update(color_features(cleaned, mask))
+        feats.update(texture_features(cleaned, mask))
         seg_q = 1.0
         seg_method = 'legacy'
 
