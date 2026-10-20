@@ -474,35 +474,6 @@ async def predict(file: UploadFile = File(...)):
             "gradcam_image": None
         }
 
-    # ด่านตรวจจับผื่นแดง / ตุ่มกระจายหลายจุด (Diffuse Rash & Multiple Spots Guard)
-    # รอยโรคมะเร็งหรือไฝในชุดข้อมูล ISIC จะเป็นก้อนเดี่ยว (Focal Single Lesion)
-    # หากพบตุ่มแดงขนาดเล็กกระจายตัวจำนวนมาก หรือเป็นปื้นผื่นแดงกว้าง (Erythema / Rash)
-    # ถือว่าอยู่นอกเหนือขอบเขตโมเดล ISIC ทันที เพื่อป้องกันไม่ให้ผื่น/สิว/ลมพิษ ถูกเข้าใจผิดเป็นมะเร็ง
-    r_ch = img_rgb[:, :, 0].astype(np.float32)
-    g_ch = img_rgb[:, :, 1].astype(np.float32)
-    b_ch = img_rgb[:, :, 2].astype(np.float32)
-    erythema = (r_ch - g_ch) + (r_ch - b_ch)
-    erythema_mask = (erythema > 35.0) & (r_ch > 120)
-    erythema_ratio = float(erythema_mask.sum()) / total_px
-
-    num_spots = 0
-    if OPENCV_AVAILABLE:
-        m8 = (erythema_mask.astype(np.uint8) * 255)
-        spot_cnts, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        num_spots = sum(1 for c in spot_cnts if 10 < cv2.contourArea(c) < 600)
-
-    is_diffuse_rash = (num_spots >= 5) or (erythema_ratio > 0.20 and num_spots >= 3)
-    if is_diffuse_rash:
-        return {
-            "is_skin": True,
-            "is_out_of_scope": True,
-            "predicted_disease": "ไม่สามารถประเมินผลได้",
-            "confidence": 0.0,
-            "risk_level": "uncertain",
-            "message": "ตรวจพบผื่นแดงหรือตุ่มกระจายตัวหลายจุด (ไม่ใช่รอยโรคเดี่ยวหรือไฝ) ระบบถูกออกแบบมาเพื่อจำแนกเฉพาะ ไฝ/รอยโรคเดี่ยว (ISIC) จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด แนะนำปรึกษาแพทย์ผิวหนังเพื่อตรวจรักษาผื่นนะคะ",
-            "gradcam_image": None
-        }
-
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
