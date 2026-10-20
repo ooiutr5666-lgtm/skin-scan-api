@@ -413,6 +413,70 @@ def check_is_skin(img_rgb):
     ratio = float(skin_mask.sum()) / float(img_rgb.shape[0] * img_rgb.shape[1])
     return ratio >= 0.20 # ต้องมีพิกเซลผิวหนังอย่างน้อย 20%
 
+# ตรวจสอบการมีอยู่ของเม็ดสีเมลานิน (Melanin Pigment & Clinical Scope Guard)
+# ไฝและมะเร็งผิวหนังตามเกณฑ์ ISIC (Melanocytic Lesions) ต้องมีเม็ดสีเมลานินเข้ม (น้ำตาล/ดำ/เทา)
+# และมีความมืดกว่าผิวรอบข้างชัดเจน ในขณะที่ผื่นแพ้ สิว หรือการอักเสบ (Erythematous/Inflammatory) 
+# จะมีสีแดง/ชมพูนำเด่น และไม่มีเม็ดสีเข้มของไฝ
+def check_melanin_pigmentation(img_rgb, mask):
+    if not OPENCV_AVAILABLE:
+        return True, "valid"
+    inside = mask > 0
+    outside = ~inside
+    if inside.sum() < 25 or outside.sum() < 50:
+        return True, "valid"
+
+    # คำนวณในระบบสี Lab
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L_in = lab[..., 0][inside]
+    L_out = lab[..., 0][outside]
+    a_in = lab[..., 1][inside]
+    a_out = lab[..., 1][outside]
+
+    mean_L_in = float(L_in.mean())
+    mean_L_out = float(L_out.mean())
+    mean_a_in = float(a_in.mean())
+    mean_a_out = float(a_out.mean())
+
+    lum_drop = mean_L_out - mean_L_in  # ความมืดเมื่อเทียบกับผิวรอบข้าง
+    redness_excess = mean_a_in - mean_a_out  # ความแดงส่วนเกินใน Lab a*
+
+    # คำนวณความแดงเทียบกับเขียวและน้ำเงิน (Erythema Index ใน RGB)
+    r_in = img_rgb[..., 0][inside].astype(np.float32)
+    g_in = img_rgb[..., 1][inside].astype(np.float32)
+    b_in = img_rgb[..., 2][inside].astype(np.float32)
+    erythema = (r_in - g_in) + (r_in - b_in)
+    mean_erythema = float(erythema.mean())
+
+    # เม็ดสีเมลานินเข้ม (Dark Melanin Pigment): พิกเซลที่มีค่า L* < 115 หรือเฉดสีคล้ำเข้ม
+    dark_pigment_pixels = ((L_in < 115) | ((r_in < 130) & (g_in < 100) & (b_in < 90))).sum()
+    dark_pigment_ratio = float(dark_pigment_pixels) / float(inside.sum())
+
+    # 1. กรณีเป็นผื่นแดงกว้าง หรือสิวอักเสบ (Pure Erythema / Inflammatory Condition):
+    # แดงชัดเจน แต่แทบไม่มีเม็ดสีเข้มของไฝเลย และไม่มืดกว่าผิวรอบข้าง
+    is_pure_erythema = (
+        (mean_erythema > 35.0 or redness_excess > 5.0) and
+        (dark_pigment_ratio < 0.06) and
+        (lum_drop < 8.0)
+    )
+
+    # 2. กรณีตุ่มแดงสว่าง (Bright Red Papule / Acne): สว่างเท่าหรือมากกว่าผิวรอบข้าง แต่แดงจัด
+    is_bright_red = (
+        (lum_drop <= 2.0) and
+        (mean_erythema > 40.0 or redness_excess > 6.0) and
+        (dark_pigment_ratio < 0.08)
+    )
+
+    # 3. กรณีผื่นแดงกระจายตัวที่ไม่มีเม็ดสีเมลานิน (Diffuse Non-pigmented Rash)
+    is_diffuse_rash = (
+        (dark_pigment_ratio < 0.03) and
+        (lum_drop < 5.0) and
+        (mean_erythema > 28.0 or redness_excess > 4.0)
+    )
+
+    if is_pure_erythema or is_bright_red or is_diffuse_rash:
+        return False, "erythematous_rash_or_acne"
+
+    return True, "pigmented_lesion"
 
 @app.get("/")
 def read_root():
@@ -513,6 +577,23 @@ async def predict(file: UploadFile = File(...)):
             "gradcam_image": None
         }
 
+    # ด่านตรวจจับเม็ดสีเมลานิน (Melanin Pigment & Clinical Scope Guard)
+    # รอยโรคในชุดข้อมูล ISIC (Melanocytic Nevi / Melanoma) ต้องมีเม็ดสีเมลานินเข้ม
+    # หากตรวจพบว่าเป็นเพียงรอยแดง/ผื่นอักเสบ/สิว (Erythematous/Inflammatory) ที่ไม่มีเม็ดสีเมลานินเข้ม
+    # ระบบจะปฏิเสธการประเมินเพื่อความปลอดภัยทางการแพทย์ (Safe AI Concept) เพื่อไม่ให้สับสนกับโรคมะเร็ง
+    is_pigmented, pigment_category = check_melanin_pigmentation(img_rgb, mask)
+    if not is_pigmented:
+        return {
+            "is_skin": True,
+            "is_out_of_scope": True,
+            "clinical_category": "erythematous_rash_or_acne",
+            "predicted_disease": "ไม่สามารถประเมินผลได้",
+            "confidence": 0.0,
+            "risk_level": "uncertain",
+            "message": "ตรวจพบลักษณะเป็นผื่นแดงหรือการอักเสบของผิวหนัง (Erythema / Inflammatory Skin Condition) โดยไม่พบกลุ่มเม็ดสีเมลานินเข้มของไฝ (Non-pigmented)\n\nระบบ Skin Scan ถูกพัฒนาด้วยชุดข้อมูล ISIC เพื่อคัดกรองเฉพาะ 'ไฝและมะเร็งผิวหนังชนิดมีเม็ดสี' (Melanocytic Lesions) จึงปฏิเสธการประเมินเพื่อความปลอดภัยทางการแพทย์ เพื่อป้องกันไม่ให้เกิดความเข้าใจผิด แนะนำปรึกษาแพทย์เฉพาะทางผิวหนังเพื่อตรวจรักษาอาการผื่นหรือสิวค่ะ",
+            "gradcam_image": None
+        }
+
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -594,13 +675,13 @@ async def predict(file: UploadFile = File(...)):
             detail=f"โมเดลไม่สามารถประมวลผลการจำแนกได้: {str(e)}"
         )
 
-    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 65%)
-    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 65% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
-    is_uncertain = (confidence < 65.0)
+    # เกณฑ์ความปลอดภัยทางการแพทย์ (Safety Confidence Threshold >= 68%)
+    # หากโมเดลทำนายได้ความมั่นใจต่ำกว่า 68% ถือว่าเป็นกรณีภาพกำกวมหรือไม่อยู่ในโมเดล จึงไม่เดาผล
+    is_uncertain = (confidence < 68.0)
     if is_uncertain:
-        disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ (Uncertain)"
+        disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
         risk_level = "uncertain"
-        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย 65% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
+        message = f"AI มั่นใจเพียง {round(confidence, 1)}% ต่ำกว่าเกณฑ์ความปลอดภัย 68% จึงไม่เดาผล เพื่อไม่ให้ได้คำแนะนำที่ผิด"
     else:
         disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
         risk_level = "high" if is_malignant else "low"
