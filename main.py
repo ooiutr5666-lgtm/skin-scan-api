@@ -95,13 +95,95 @@ loaded_classes = [0, 1]
 loaded_ood = None  # ตัวตรวจภาพนอกขอบเขต (Mahalanobis) จาก Colab ถ้ามี
 loaded_model_name = None
 loaded_model_size = 0
+loaded_cnn = None
+loaded_cnn_type = None  # 'onnx', 'tflite', or 'keras'
+loaded_w_cnn = 0.0
+loaded_t_lo = 0.22
+loaded_t_hi = 0.51
+
+def get_trained_cnn():
+    global loaded_cnn, loaded_cnn_type
+    if loaded_cnn is not None:
+        return loaded_cnn
+    
+    cnn_candidates = [
+        ('cnn.onnx', 'onnx'),
+        ('model.onnx', 'onnx'),
+        ('cnn.tflite', 'tflite'),
+        ('model.tflite', 'tflite'),
+        ('cnn.keras', 'keras'),
+        ('model.keras', 'keras'),
+        ('cnn.h5', 'keras'),
+    ]
+    for cpath, ctype in cnn_candidates:
+        if os.path.exists(cpath):
+            try:
+                if ctype == 'onnx':
+                    import onnxruntime as ort
+                    loaded_cnn = ort.InferenceSession(cpath, providers=['CPUExecutionProvider'])
+                    loaded_cnn_type = 'onnx'
+                    print(f"[OK] CNN Loaded via ONNX Runtime: {cpath}")
+                    return loaded_cnn
+                elif ctype == 'tflite':
+                    try:
+                        import tflite_runtime.interpreter as tflite
+                    except ImportError:
+                        import tensorflow.lite as tflite
+                    interpreter = tflite.Interpreter(model_path=cpath)
+                    interpreter.allocate_tensors()
+                    loaded_cnn = interpreter
+                    loaded_cnn_type = 'tflite'
+                    print(f"[OK] CNN Loaded via TFLite: {cpath}")
+                    return loaded_cnn
+                elif ctype == 'keras':
+                    try:
+                        import tensorflow as tf
+                        loaded_cnn = tf.keras.models.load_model(cpath, compile=False)
+                        loaded_cnn_type = 'keras'
+                        print(f"[OK] CNN Loaded via Keras/TensorFlow: {cpath}")
+                        return loaded_cnn
+                    except ImportError:
+                        import keras
+                        loaded_cnn = keras.models.load_model(cpath, compile=False)
+                        loaded_cnn_type = 'keras'
+                        print(f"[OK] CNN Loaded via Keras: {cpath}")
+                        return loaded_cnn
+            except Exception as e:
+                print(f"[WARN] Failed to load CNN {cpath}: {e}")
+    return None
+
+def predict_cnn_prob(img_rgb):
+    """ทำนายความน่าจะเป็นของมะเร็งผิวหนังด้วยโมเดล CNN (EfficientNetB0)"""
+    cnn = get_trained_cnn()
+    if cnn is None:
+        return None
+    try:
+        img_resized = cv2.resize(img_rgb, (224, 224))
+        x = np.expand_dims(img_resized.astype(np.float32), axis=0)
+        
+        if loaded_cnn_type == 'onnx':
+            input_name = cnn.get_inputs()[0].name
+            preds = cnn.run(None, {input_name: x})[0]
+            return float(preds[0][0])
+        elif loaded_cnn_type == 'tflite':
+            input_details = cnn.get_input_details()
+            output_details = cnn.get_output_details()
+            cnn.set_tensor(input_details[0]['index'], x)
+            cnn.invoke()
+            preds = cnn.get_tensor(output_details[0]['index'])
+            return float(preds[0][0])
+        elif loaded_cnn_type == 'keras':
+            preds = loaded_cnn.predict(x, verbose=0)
+            return float(preds[0][0])
+    except Exception as e:
+        print(f"[WARN] CNN prediction failed: {e}")
+        return None
 
 def get_trained_pipeline():
-    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes, loaded_ood, loaded_model_name, loaded_model_size
+    global loaded_pipeline, loaded_threshold, loaded_feat_cols, loaded_classes, loaded_ood, loaded_model_name, loaded_model_size, loaded_w_cnn, loaded_t_lo, loaded_t_hi
     if loaded_pipeline is not None:
         return loaded_pipeline
     if JOBLIB_AVAILABLE:
-        # ค้นหาตามรายชื่อที่พบบ่อย และค้นหาไฟล์ .joblib หรือ .pkl ทั้งหมดในโฟลเดอร์
         candidates = list(MODEL_FILENAMES)
         for f in glob.glob("*.joblib") + glob.glob("*.pkl"):
             if f not in candidates:
@@ -112,10 +194,8 @@ def get_trained_pipeline():
                 try:
                     obj = joblib.load(fname)
                     if isinstance(obj, dict):
-                        # รองรับทั้งคีย์ 'model', 'hand' (Handcrafted Pipeline), และ 'pipeline'
                         loaded_pipeline = obj.get('model') or obj.get('hand') or obj.get('pipeline') or obj.get('clf')
                         if loaded_pipeline is None:
-                            # หากไม่มีคีย์ข้างต้น ให้ค้นหา object ตัวแรกที่เป็น Pipeline หรือ Classifier ใน dict
                             for v in obj.values():
                                 if hasattr(v, 'predict') or hasattr(v, 'predict_proba'):
                                     loaded_pipeline = v
@@ -123,7 +203,10 @@ def get_trained_pipeline():
                         if loaded_pipeline is None:
                             loaded_pipeline = obj
 
-                        loaded_threshold = float(obj.get('threshold') or obj.get('t_hi') or obj.get('t_lo') or 0.5)
+                        loaded_t_hi = float(obj.get('t_hi', 0.51))
+                        loaded_t_lo = float(obj.get('t_lo', 0.22))
+                        loaded_threshold = float(obj.get('threshold') or loaded_t_hi)
+                        loaded_w_cnn = float(obj.get('w_cnn', 0.7 if get_trained_cnn() is not None else 0.0))
                         loaded_feat_cols = obj.get('feat_cols', None)
                         loaded_ood = obj.get('ood', None)
                         if 'classes' in obj:
@@ -134,7 +217,6 @@ def get_trained_pipeline():
                     loaded_model_name = fname
                     loaded_model_size = os.path.getsize(fname)
 
-                    # ตรวจสอบ classes_ จากโมเดลจริงโดยตรง
                     if hasattr(loaded_pipeline, 'classes_'):
                         loaded_classes = list(loaded_pipeline.classes_)
                     elif hasattr(loaded_pipeline, 'named_steps') and 'clf' in loaded_pipeline.named_steps:
@@ -142,7 +224,7 @@ def get_trained_pipeline():
                         if hasattr(clf, 'classes_'):
                             loaded_classes = list(clf.classes_)
 
-                    print(f"[OK] Model loaded from: {fname} (size={loaded_model_size}, threshold={loaded_threshold}, classes={loaded_classes})")
+                    print(f"[OK] Model loaded from: {fname} (size={loaded_model_size}, threshold={loaded_threshold}, classes={loaded_classes}, w_cnn={loaded_w_cnn})")
                     return loaded_pipeline
                 except Exception as e:
                     print(f"[WARN] Failed to load model from {fname}: {e}")
@@ -174,7 +256,7 @@ def _otsu_pick(M, h, w):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     lab = label(mask > 0)
-    best, best_score = None, -1
+    candidates = []
     for r in regionprops(lab):
         if r.area < (0.002 * h * w):
             continue
@@ -182,13 +264,23 @@ def _otsu_pick(M, h, w):
         dist = np.hypot(cy - h / 2, cx - w / 2) / (np.hypot(h / 2, w / 2) + 1e-6)
         b_hits = int(r.bbox[0] <= 1) + int(r.bbox[1] <= 1) + int(r.bbox[2] >= h - 2) + int(r.bbox[3] >= w - 2)
         if b_hits >= 2:
-            continue  # ชิ้นส่วนที่แตะขอบภาพตั้งแต่ 2 ด้าน (ริมฝีปาก/ขอบเสื้อ) ตัดทิ้งทันที
-        penalty = 0.1 if b_hits == 1 else 1.0
+            continue  # ชิ้นส่วนที่แตะขอบภาพตั้งแต่ 2 ด้านขึ้นไป (ริมฝีปาก/ขอบเสื้อ) ตัดทิ้งทันที
+        penalty = 0.05 if b_hits == 1 else 1.0
         score = float(r.area) * (max(0.0, 1.0 - dist) ** 1.2) * penalty
-        if score > best_score:
-            best, best_score = r.label, score
-    if best is None:
+        candidates.append((b_hits, dist, score, r.label))
+    
+    if not candidates:
         return None
+
+    # ลำดับความสำคัญ: ถ้ามีชิ้นส่วนตรงกลางที่ไม่แตะขอบภาพเลย (เช่น ไฝแท้บนผิวหนัง)
+    # ให้เลือกชิ้นส่วนที่ไม่แตะขอบเสมอ เพื่อป้องกันไม่ให้ริมฝีปากหรือขอบเสื้อที่อยู่ขอบภาพมาแย่งคะแนน
+    non_border = [c for c in candidates if c[0] == 0]
+    if non_border:
+        best_cand = max(non_border, key=lambda c: c[2])
+    else:
+        best_cand = max(candidates, key=lambda c: c[2])
+    
+    best = best_cand[3]
     mask = (lab == best).astype(np.uint8) * 255
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     cv2.drawContours(mask, cnts, -1, 255, -1)  # เติมรูภายใน
@@ -640,21 +732,30 @@ async def predict(file: UploadFile = File(...)):
 
         benign_idx = 0 if malignant_idx != 0 else 1
 
-        # 3. ส่งข้อมูลเข้าโมเดลโดยตรง
+        # 3. ส่งข้อมูลเข้าโมเดล SVM (Handcrafted Features)
         if hasattr(pipeline, "predict_proba"):
             probs = pipeline.predict_proba(df_feat.values)[0]
-            prob_malignant = float(probs[malignant_idx])
-            
-            # ใช้ Decision Threshold ที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
-            is_malignant = (prob_malignant >= loaded_threshold)
-            
-            # คำนวณค่าความเชื่อมั่นตามคลาสที่โมเดลตัดสินใจจริง
-            confidence = float((prob_malignant if is_malignant else probs[benign_idx]) * 100.0)
+            prob_hand = float(probs[malignant_idx])
         else:
             pred = pipeline.predict(df_feat.values)[0]
-            is_malignant = (pred == loaded_classes[malignant_idx])
-            prob_malignant = 1.0 if is_malignant else 0.0
-            confidence = 100.0
+            prob_hand = 1.0 if (pred == loaded_classes[malignant_idx]) else 0.0
+
+        # 4. ส่งข้อมูลเข้าโมเดล CNN (ถ้ามีไฟล์โมเดลและ runtime พร้อม)
+        prob_cnn = predict_cnn_prob(img_rgb)
+
+        # 5. รวมผลแบบ Ensemble (ตามสัดส่วน w_cnn ใน bundle.joblib เช่น 70% CNN + 30% SVM)
+        if prob_cnn is not None and loaded_w_cnn > 0.0:
+            prob_malignant = float(loaded_w_cnn * prob_cnn + (1.0 - loaded_w_cnn) * prob_hand)
+            active_model_desc = f"Ensemble v4 ({int(loaded_w_cnn*100)}% CNN + {int((1.0-loaded_w_cnn)*100)}% SVM)"
+        else:
+            prob_malignant = prob_hand
+            active_model_desc = "Handcrafted ABCD + SVM Pipeline (SVM 100%)"
+
+        # ใช้ Decision Threshold ที่จูนไว้จาก Colab เพื่อควบคุม Recall >= 90%
+        is_malignant = (prob_malignant >= loaded_threshold)
+
+        # คำนวณค่าความเชื่อมั่นตามคลาสที่โมเดลตัดสินใจจริง
+        confidence = float((prob_malignant if is_malignant else (1.0 - prob_malignant)) * 100.0)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -691,6 +792,9 @@ async def predict(file: UploadFile = File(...)):
         "message": message,
         "threshold": round(loaded_threshold, 3),
         "prob_malignant": round(prob_malignant, 4),
+        "prob_cnn": round(prob_cnn, 4) if prob_cnn is not None else None,
+        "prob_hand": round(prob_hand, 4),
+        "model_type": active_model_desc,
         "gradcam_image": overlay_b64,
         "abcd_metrics": {
             "asymmetry": {
