@@ -544,13 +544,13 @@ async def predict(file: UploadFile = File(...)):
         seg_q = 1.0
         seg_method = 'legacy'
 
-    # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check)
+    # ตรวจสอบการมีอยู่ของรอยโรค/ไฝ (Lesion Presence Check - รองรับไฝขนาดเล็กตั้งแต่ 0.2%)
     inside = mask > 0
     outside = ~inside
     total_px = float(mask.shape[0] * mask.shape[1])
     lesion_ratio = float(inside.sum()) / total_px
 
-    if inside.sum() < (224 * 224 * 0.005) or outside.sum() < (224 * 224 * 0.05) or (FEATURES_MODULE_AVAILABLE and seg_q < 0.03):
+    if inside.sum() < (224 * 224 * 0.002) or outside.sum() < (224 * 224 * 0.05) or (FEATURES_MODULE_AVAILABLE and seg_q < 0.03):
         return {
             "is_skin": True,
             "has_lesion": False,
@@ -564,11 +564,15 @@ async def predict(file: UploadFile = File(...)):
     ys, xs = np.where(inside)
     borders_touched = int(ys.min() == 0) + int(ys.max() == mask.shape[0] - 1) + \
         int(xs.min() == 0) + int(xs.max() == mask.shape[1] - 1)
+    
+    edge_px = int((mask[:2, :] > 0).sum() + (mask[-2:, :] > 0).sum() +
+                  (mask[:, :2] > 0).sum() + (mask[:, -2:] > 0).sum())
 
-    out_of_scope = (lesion_ratio < 0.015) or (lesion_ratio > 0.70) or \
-        (borders_touched >= 2 and lesion_ratio > 0.18) or \
+    out_of_scope = (lesion_ratio < 0.002) or (lesion_ratio > 0.65) or \
+        (borders_touched >= 2 and lesion_ratio > 0.12) or \
+        (borders_touched >= 1 and edge_px > 15 and lesion_ratio > 0.10) or \
         (borders_touched >= 3) or \
-        (FEATURES_MODULE_AVAILABLE and seg_q < 0.06 and seg_method == 'fallback_ellipse')
+        (FEATURES_MODULE_AVAILABLE and seg_q < 0.04 and seg_method == 'fallback_ellipse')
 
     if out_of_scope:
         return {

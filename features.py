@@ -30,9 +30,12 @@ def remove_hair(img_rgb):
 
 
 def _clean(mask):
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    # ใช้ MORPH_OPEN ขนาด (5, 5) เพื่อตัดคอคอดหรือเส้นเชื่อมระหว่างรอยโรคกับริมฝีปาก/เงา
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=2)
+    # ใช้ MORPH_CLOSE ขนาดเล็ก (3, 3) เพียงรอบเดียวเพื่อเติมรูเล็กๆ ภายในตัวไฝ ไม่ให้เชื่อมข้ามไปยังริมฝีปาก
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=1)
     return mask
 
 
@@ -57,14 +60,12 @@ def _quality(mask):
     touch_px = int((m & edge).sum())
     borders_hit = int(ys.min() <= 2) + int(ys.max() >= h - 3) + int(xs.min() <= 2) + int(xs.max() >= w - 3)
 
-    # หากติดขอบภาพตั้งแต่ 2 ด้านขึ้นไป (เช่น ริมฝีปาก, ขอบเสื้อ, ขอบภาพ) ให้คะแนนเป็น 0 ทันที
-    if borders_hit >= 2:
+    # หากติดขอบภาพตั้งแต่ 2 ด้านขึ้นไป หรือติดขอบด้านใดด้านหนึ่งเกิน 15 พิกเซล (เช่น ริมฝีปากที่ขอบล่าง) ให้คะแนนเป็น 0 ทันที
+    if borders_hit >= 2 or touch_px > 15:
         return 0.0
     
-    if touch_px > 12:
-        border_penalty = 0.1
-    elif touch_px > 0:
-        border_penalty = 0.5
+    if touch_px > 0:
+        border_penalty = 0.05
     else:
         border_penalty = 1.0
 
@@ -86,24 +87,35 @@ def _quality(mask):
 
 
 def _pick(M, valid, h, w):
-    """Otsu เฉพาะ pixel ที่ valid แล้วเลือก component ที่อยู่กลางภาพและไม่แนบขอบ"""
-    M = cv2.GaussianBlur(M.astype(np.float32), (5, 5), 0)
-    vals = M[valid]
+    """Otsu แบบ Multi-Level เพื่อแยกเม็ดไฝสีเข้มออกจากเนื้อเยื่อข้างเคียง (เช่น ริมฝีปาก)"""
+    M_smooth = cv2.GaussianBlur(M.astype(np.float32), (5, 5), 0)
+    vals = M_smooth[valid]
     if vals.size < 50 or vals.std() < 1e-3:
         return None
-    t = threshold_otsu(vals)
-    mask = ((M > t) & valid).astype(np.uint8) * 255
-    mask = _clean(mask)
-    lab = label(mask > 0)
+    t0 = threshold_otsu(vals)
+    val_max = float(vals.max())
+    
+    # ทดสอบ 3 ระดับ Threshold เพื่อค้นหาเม็ดสีที่เข้มที่สุด (ไฝ) แยกขาดจากริมฝีปาก
+    thresholds = [t0]
+    if val_max > t0:
+        thresholds.append(t0 + 0.25 * (val_max - t0))
+        thresholds.append(t0 + 0.45 * (val_max - t0))
+
     best, best_s = None, 0.0
-    for r in regionprops(lab):
-        # ลดเกณฑ์ขนาดขั้นต่ำลงเหลือ 0.002 (ประมาณ 100 px) เพื่อไม่ให้ข้ามไฝเม็ดเล็ก
-        if r.area < 0.002 * h * w:
-            continue
-        comp = (lab == r.label).astype(np.uint8) * 255
-        s = _quality(comp)
-        if s > best_s:
-            best, best_s = comp, s
+    for t in thresholds:
+        raw_mask = ((M_smooth > t) & valid).astype(np.uint8) * 255
+        cleaned_mask = _clean(raw_mask)
+        lab = label(cleaned_mask > 0)
+        for r in regionprops(lab):
+            if r.area < 0.002 * h * w:
+                continue
+            comp = (lab == r.label).astype(np.uint8) * 255
+            s = _quality(comp)
+            if t > t0:
+                s *= 1.2  # โบนัสความเข้มคมชัดของเม็ดสีไฝ
+            if s > best_s:
+                best, best_s = comp, s
+
     if best is None:
         return None
     cnts, _ = cv2.findContours(best, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
