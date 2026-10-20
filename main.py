@@ -39,13 +39,14 @@ app.add_middleware(
 
 CLASSES = ['benign', 'malignant'] # 0 = benign (ไฝปกติ), 1 = malignant (มะเร็งผิวหนัง)
 
-# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (เรียงตามลำดับความสำคัญ และรองรับชื่อไฟล์ที่ดาวน์โหลดซ้ำ)
+# รายชื่อไฟล์โมเดลที่บันทึกจาก Google Colab (ให้ skin_cancer_pipeline.joblib มีลำดับความสำคัญสูงสุด)
 MODEL_FILENAMES = [
-    'model (1).joblib',
-    'model (2).joblib',
-    'model.joblib',
-    'skin_cancer_pipeline (1).joblib',
     'skin_cancer_pipeline.joblib',
+    'skin_cancer_pipeline (2).joblib',
+    'skin_cancer_pipeline (1).joblib',
+    'model.joblib',
+    'model (2).joblib',
+    'model (1).joblib',
     'skin_cancer_model.joblib',
     'model.pkl',
     'pipeline.pkl'
@@ -398,19 +399,28 @@ def check_is_skin(img_rgb):
 
 @app.get("/")
 def read_root():
-    model_loaded = (get_trained_pipeline() is not None)
-    return {
-        "status": "online",
-        "project": "Skin Cancer: Malignant vs. Benign (ISIC/Kaggle)",
-        "model_loaded": model_loaded,
-        "model_file": loaded_model_name,
-        "model_size_bytes": loaded_model_size,
-        "threshold": loaded_threshold,
-        "has_ood_guard": (loaded_ood is not None),
-        "classes": loaded_classes,
-        "features_count": 58,
-        "criteria": "Handcrafted ABCD + Texture (Asymmetry, Border, Color, Diameter, GLCM/LBP)"
-    }
+    try:
+        model_loaded = (get_trained_pipeline() is not None)
+        classes_clean = [int(x) if str(x).isdigit() else str(x) for x in loaded_classes] if loaded_classes else [0, 1]
+        thr_clean = float(loaded_threshold) if loaded_threshold is not None else 0.5
+        return {
+            "status": "online",
+            "project": "Skin Cancer: Malignant vs. Benign (ISIC/Kaggle)",
+            "model_loaded": model_loaded,
+            "model_file": str(loaded_model_name) if loaded_model_name else None,
+            "model_size_bytes": int(loaded_model_size),
+            "threshold": thr_clean,
+            "has_ood_guard": (loaded_ood is not None),
+            "classes": classes_clean,
+            "features_count": 58,
+            "criteria": "Handcrafted ABCD + Texture (Asymmetry, Border, Color, Diameter, GLCM/LBP)"
+        }
+    except Exception as e:
+        return {
+            "status": "online",
+            "error_note": str(e),
+            "model_loaded": (loaded_pipeline is not None)
+        }
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
