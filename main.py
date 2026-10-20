@@ -583,19 +583,24 @@ def check_melanin_pigmentation(img_rgb, mask):
 def read_root():
     try:
         model_loaded = (get_trained_pipeline() is not None)
+        cnn = get_trained_cnn()
+        cnn_loaded = (cnn is not None)
         classes_clean = [int(x) if str(x).isdigit() else str(x) for x in loaded_classes] if loaded_classes else [0, 1]
         thr_clean = float(loaded_threshold) if loaded_threshold is not None else 0.5
         return {
             "status": "online",
             "project": "Skin Cancer: Malignant vs. Benign (ISIC/Kaggle)",
             "model_loaded": model_loaded,
+            "cnn_loaded": cnn_loaded,
+            "cnn_type": loaded_cnn_type if cnn_loaded else None,
+            "ensemble_mode": f"70% CNN + 30% SVM (w_cnn={loaded_w_cnn})" if cnn_loaded else "SVM Only (fallback)",
             "model_file": str(loaded_model_name) if loaded_model_name else None,
             "model_size_bytes": int(loaded_model_size),
             "threshold": thr_clean,
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
-            "criteria": "Handcrafted ABCD + Texture (Asymmetry, Border, Color, Diameter, GLCM/LBP)"
+            "criteria": "Ensemble v4: Deep Learning (EfficientNetB0) + Handcrafted ABCD/Texture"
         }
     except Exception as e:
         return {
