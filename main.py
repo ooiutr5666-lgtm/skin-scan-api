@@ -654,7 +654,7 @@ def read_root():
             "threshold": float(loaded_t_lo),
             "threshold_screening": float(loaded_t_lo),
             "threshold_precision": float(loaded_t_hi),
-            "version": "v4.2-primary-cnn-ensemble",
+            "version": "v4.3-melanin-gatekeeper-3tier",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
