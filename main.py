@@ -613,7 +613,11 @@ def check_melanin_pigmentation(img_rgb, mask):
         (mean_erythema > 28.0 or redness_excess > 4.0)
     )
 
-    if is_pure_erythema or is_bright_red or is_diffuse_rash:
+    # 4. ขาดเม็ดสีเมลานินโดยสิ้นเชิง (Non-pigmented lesion / Rash / Fungus / กลากเกลื้อน)
+    # ไฝและมะเร็งผิวหนังตามเกณฑ์ ISIC ต้องมีเม็ดสีเมลานินเข้ม หากไม่มีเม็ดสีเข้มเลย (<4%) และไม่มืดกว่าผิวรอบข้าง (<7.0)
+    is_non_pigmented = (dark_pigment_ratio < 0.04) and (lum_drop < 7.0)
+
+    if is_pure_erythema or is_bright_red or is_diffuse_rash or is_non_pigmented:
         return False, "erythematous_rash_or_acne"
 
     return True, "pigmented_lesion"
@@ -760,6 +764,37 @@ async def predict(file: UploadFile = File(...)):
                 "message": "ตรวจไม่พบรอยโรคหรือไฝที่มีขอบเขตชัดเจนบนผิวหนัง ภาพมีแสงสว่างสม่ำเสมอ กรุณาถ่ายภาพโดยเน้นบริเวณรอยโรคที่ต้องการตรวจค่ะ",
                 "gradcam_image": None
             }
+
+    # 4. ตรวจสอบกรณีโมเดลจับขอบไม่ได้และใช้ fallback ellipse โดยไม่มีเม็ดสีเข้ม
+    if seg_method == 'fallback_ellipse':
+        lab_tmp = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+        dark_cnt = ((lab_tmp[..., 0][inside] < 115)).sum()
+        if dark_cnt / float(inside.sum()) < 0.06:
+            return {
+                "is_skin": True,
+                "has_lesion": False,
+                "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
+                "confidence": 0.0,
+                "risk_level": "uncertain",
+                "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง\n\n📌 ระบบไม่สามารถระบุขอบเขตของไฝได้อย่างชัดเจน เพื่อความปลอดภัยทางการแพทย์จึงไม่เดาสุ่มผล กรุณาถ่ายภาพระยะประชิด 10–15 ซม. โดยจัดให้ไฝอยู่ตรงกลางภาพค่ะ",
+                "gradcam_image": None
+            }
+
+    # 5. Melanin Pigment & Clinical Scope Guard (กรองผื่นแดง ผื่นเชื้อรากลากเกลื้อน สิว หรือรอยโรคที่อยู่นอกขอบเขตโมเดล)
+    # โมเดลถูกฝึกสอนด้วยชุดข้อมูล ISIC สำหรับคัดกรองเฉพาะไฝและมะเร็งผิวหนังชนิด Melanocytic Lesion เท่านั้น
+    # หากตรวจพบว่าเป็นผื่นแดง รอยอักเสบ หรือรอยโรคที่ไม่มีเม็ดสีเมลานินเข้ม ให้นำออกจากการคัดกรองทันที (Out-of-Scope)
+    is_melanin_lesion, lesion_clinical_cat = check_melanin_pigmentation(img_rgb, mask)
+    if not is_melanin_lesion and lesion_clinical_cat == "erythematous_rash_or_acne":
+        return {
+            "is_skin": True,
+            "is_out_of_scope": True,
+            "clinical_category": "erythematous_rash_or_acne",
+            "predicted_disease": "ไม่สามารถประเมินผลได้",
+            "confidence": 0.0,
+            "risk_level": "uncertain",
+            "message": "ตรวจพบผื่นแดงหรือรอยโรคผิวหนังทั่วไป ซึ่งอยู่นอกเหนือขอบเขตการคัดกรองไฝและมะเร็งผิวหนังที่โมเดลถูกฝึกสอน ระบบจึงคัดกรองออกเพื่อความปลอดภัย ไม่เดาสุ่มผล แนะนำให้ปรึกษาแพทย์เฉพาะทางผิวหนังโดยตรงค่ะ",
+            "gradcam_image": None
+        }
 
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
