@@ -502,33 +502,72 @@ def extract_handcrafted(img_rgb):
     feats.update(texture_features(cleaned, mask))
     return feats, mask, cleaned
 
-# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold - HSV + YCrCb + RGB)
+# ปรับสมดุลแสงและสี (Color Constancy - Shades of Gray / Gray-World Normalization)
+# เพื่อลบแสงเหลือง แสงนีออน หรือเงามืดหลอกตา ทำให้สีผิวจริงและสีเม็ดสีชัดเจนตามมาตรฐานคลินิก
+def normalize_color_illumination(img_rgb):
+    if not OPENCV_AVAILABLE:
+        return img_rgb
+    img_float = img_rgb.astype(np.float32)
+    mean_r = float(np.mean(img_float[:, :, 0]))
+    mean_g = float(np.mean(img_float[:, :, 1]))
+    mean_b = float(np.mean(img_float[:, :, 2]))
+    mean_gray = (mean_r + mean_g + mean_b) / 3.0
+    if mean_r < 10 or mean_g < 10 or mean_b < 10:
+        return img_rgb
+    scale_r = float(np.clip(mean_gray / mean_r, 0.78, 1.25))
+    scale_g = float(np.clip(mean_gray / mean_g, 0.78, 1.25))
+    scale_b = float(np.clip(mean_gray / mean_b, 0.78, 1.25))
+    balanced = np.zeros_like(img_float)
+    balanced[:, :, 0] = img_float[:, :, 0] * scale_r
+    balanced[:, :, 1] = img_float[:, :, 1] * scale_g
+    balanced[:, :, 2] = img_float[:, :, 2] * scale_b
+    return np.clip(balanced, 0, 255).astype(np.uint8)
+
+# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold - HSV + YCrCb + RGB + Texture Variance)
 def check_is_skin(img_rgb):
     if not OPENCV_AVAILABLE:
         return True
     
-    # 1. ตรวจสอบใน HSV Space
+    # 1. ตรวจสอบใน HSV Space (ผิวหนังมนุษย์ทุกเฉดสี H: 0-25 หรือ 168-180, S: 15-220, V: 45-255)
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    lower_hsv = np.array([0, 20, 50], dtype=np.uint8)
-    upper_hsv = np.array([28, 255, 255], dtype=np.uint8)
-    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    lower_hsv1 = np.array([0, 15, 45], dtype=np.uint8)
+    upper_hsv1 = np.array([25, 220, 255], dtype=np.uint8)
+    mask_hsv1 = cv2.inRange(hsv, lower_hsv1, upper_hsv1)
 
-    # 2. ตรวจสอบใน YCrCb Space (มาตรฐานสากลด้านการตรวจจับผิวหนังมนุษย์)
+    lower_hsv2 = np.array([168, 15, 45], dtype=np.uint8)
+    upper_hsv2 = np.array([180, 220, 255], dtype=np.uint8)
+    mask_hsv2 = cv2.inRange(hsv, lower_hsv2, upper_hsv2)
+    mask_hsv = (mask_hsv1 > 0) | (mask_hsv2 > 0)
+
+    # 2. ตรวจสอบใน YCrCb Space (มาตรฐานสากลตรวจจับผิวหนังมนุษย์: Cr 133-173, Cb 77-127)
     ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
     lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
     upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
-    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb) > 0
 
     # 3. ตรวจสอบเงื่อนไขพิกเซลสีผิว (RGB Bounds)
     r = img_rgb[:, :, 0].astype(np.int16)
     g = img_rgb[:, :, 1].astype(np.int16)
     b = img_rgb[:, :, 2].astype(np.int16)
-    rgb_rule = (r > 60) & (g > 35) & (b > 25) & (r > g) & (r > b) & ((r - g) >= 8)
+    # ผิวจริงต้องมีโทนแดงนำ และไม่ใช่สีเทา วัตถุ หรือกระดาษขาว
+    rgb_rule = (r > 60) & (g > 35) & (b > 25) & (r > g) & (r > b) & ((r - g) >= 8) & ((r - b) >= 12)
 
-    # รวม Mask ของผิวหนัง
-    skin_mask = ((mask_hsv > 0) | (mask_ycrcb > 0)) & rgb_rule
+    # รวม Mask ของผิวหนัง (ต้องผ่านทั้ง HSV/YCrCb และ RGB Rule)
+    skin_mask = (mask_hsv | mask_ycrcb) & rgb_rule
     ratio = float(skin_mask.sum()) / float(img_rgb.shape[0] * img_rgb.shape[1])
-    return ratio >= 0.20 # ต้องมีพิกเซลผิวหนังอย่างน้อย 20%
+    
+    # ภาพถ่ายผิวหนังหรือไฝระยะประชิด ต้องมีสัดส่วนผิวหนังอย่างน้อย 38%
+    if ratio < 0.38:
+        return False
+
+    # ตรวจสอบว่าไม่ใช่วัตถุที่มีเส้นลายพิมพ์หรือขอบคมกระจายทั้งภาพ (Text / Dense Pattern / Fabric Filter)
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    # ถ้า laplacian_var สูงผิดปกติมาก (> 1500) มักเป็นลายพิมพ์ตัวหนังสือ ลายผ้า หรือสิ่งของ ไม่ใช่ผิวหนังมนุษย์
+    if laplacian_var > 1500.0:
+        return False
+
+    return True
 
 # ตรวจสอบการมีอยู่ของเม็ดสีเมลานิน (Melanin Pigment & Clinical Scope Guard)
 # ไฝและมะเร็งผิวหนังตามเกณฑ์ ISIC (Melanocytic Lesions) ต้องมีเม็ดสีเมลานินเข้ม (น้ำตาล/ดำ/เทา)
@@ -634,8 +673,9 @@ async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert('RGB')
     
-    # ปรับขนาดมาตรฐานการประมวลผล
-    img_rgb = np.array(image.resize((224, 224)))
+    # ปรับขนาดมาตรฐานการประมวลผล และปรับสมดุลแสงสี (Illumination & Color Constancy Normalization)
+    img_rgb_raw = np.array(image.resize((224, 224)))
+    img_rgb = normalize_color_illumination(img_rgb_raw)
 
     # ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่
     is_skin = check_is_skin(img_rgb)
@@ -691,9 +731,13 @@ async def predict(file: UploadFile = File(...)):
         seg_q = 1.0
         seg_method = 'legacy'
 
-    # ตรวจสอบการมีอยู่ของรอยโรค
+    # ตรวจสอบการมีอยู่และความสมเหตุสมผลของรอยโรค (Lesion Plausibility Guard)
     inside = mask > 0
-    if inside.sum() < 30:
+    total_pixels = float(img_rgb.shape[0] * img_rgb.shape[1])
+    lesion_ratio = float(inside.sum()) / total_pixels
+
+    # 1. รอยโรคเล็กเกินไป (จุดฝุ่น แสงสะท้อนเล็กๆ)
+    if inside.sum() < 35:
         return {
             "is_skin": True,
             "has_lesion": False,
@@ -702,6 +746,37 @@ async def predict(file: UploadFile = File(...)):
             "risk_level": "uncertain",
             "message": "ตรวจไม่พบรอยโรคหรือไฝบนผิวหนัง กรุณาถ่ายภาพใหม่โดยจัดตำแหน่งกล้องให้เห็นไฝหรือรอยโรคชัดเจนค่ะ"
         }
+
+    # 2. รอยโรคใหญ่เกินขอบเขตรอยโรคเดี่ยว (Lesion Too Large / Shadow / Obstructed)
+    # หากรอยโรคกินพื้นที่เกิน 65% ของทั้งภาพ มักเป็นเงามืด เงาเสื้อผ้า หรือถ่ายนอกระยะ
+    if lesion_ratio > 0.65:
+        return {
+            "is_skin": False,
+            "is_out_of_scope": True,
+            "predicted_disease": "ไม่สามารถประเมินผลได้",
+            "confidence": 0.0,
+            "risk_level": "uncertain",
+            "message": "ภาพถ่ายมีเงามืดหรือรอยโรคครอบคลุมเกือบทั้งภาพ เพื่อความแม่นยำ กรุณาถ่ายภาพระยะประชิด 10–15 ซม. โดยจัดให้ไฝอยู่ตรงกลางภาพค่ะ",
+            "gradcam_image": None
+        }
+
+    # 3. ตรวจสอบความตัดกันระหว่างรอยโรคกับผิวรอบข้าง (Contrast Plausibility)
+    # หากเป็นพื้นผิวเรียบ (โต๊ะ กำแพง กระดาษ) Otsu จะบังคับแบ่งภาพครึ่งๆ โดยแทบไม่มีความต่างของแสง
+    lab_full = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L_in_full = lab_full[..., 0][inside]
+    L_out_full = lab_full[..., 0][~inside]
+    if len(L_in_full) > 0 and len(L_out_full) > 0:
+        lum_diff = abs(float(L_out_full.mean()) - float(L_in_full.mean()))
+        if lum_diff < 4.2 and seg_method != 'manual':
+            return {
+                "is_skin": True,
+                "has_lesion": False,
+                "predicted_disease": "ผิวปกติ / ไม่พบรอยโรค",
+                "confidence": 0.0,
+                "risk_level": "uncertain",
+                "message": "ตรวจไม่พบรอยโรคหรือไฝที่มีขอบเขตชัดเจนบนผิวหนัง ภาพมีแสงสว่างสม่ำเสมอ กรุณาถ่ายภาพโดยเน้นบริเวณรอยโรคที่ต้องการตรวจค่ะ",
+                "gradcam_image": None
+            }
 
     # วาดเส้นขอบสีเขียวรอบรอยโรค (เหมือนรูปในข้อ 2 ของ Colab)
     show = img_rgb.copy()
@@ -789,37 +864,112 @@ async def predict(file: UploadFile = File(...)):
             prob_malignant = float(prob_hand)
             active_model_desc = "Handcrafted ABCD + SVM Pipeline (SVM 100%)"
 
-        # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์:
-        # หากใช้ CNN เป็นหลัก เกณฑ์คัดกรองความปลอดภัยอยู่ที่ 0.35 (หรือ t_lo 0.22 เมื่อมีค่า ABCD ที่เสถียร)
-        screening_threshold = 0.35 if prob_cnn is not None else loaded_t_lo
-        is_malignant = (prob_malignant >= screening_threshold)
+        # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์ตามสเปกตรัมคลินิก 3 ระดับ (3-Tier Clinical Continuum)
+        t_low = 0.35
+        t_high = 0.65
 
         # ตรวจสอบกรณีเป็นภาพผิวหนังปกติที่ไม่มีรอยโรคชัดเจน และ AI ประเมินว่าความเสี่ยงต่ำ
         is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.30)
 
-        # ตรวจสอบผื่นแดงหรือรอยระคายเคืองที่ไม่มีเม็ดสีเมลานินคล้ำ (Erythema / Rash Guard)
-        # รอยโรคที่มีสีแดงเด่นชัดแต่ไม่มีเม็ดสีคล้ำ/ดำ (L และ V ยังสว่าง) และ CNN ไม่ได้ชี้ว่าเป็นมะเร็งขั้นรุนแรง
-        c_r = feats.get('C_R_mean', 0.0)
-        c_g = feats.get('C_G_mean', 0.0)
-        c_b = feats.get('C_B_mean', 0.0)
-        c_v = feats.get('C_V_mean', 0.0)
-        c_l = feats.get('C_L_mean', 0.0)
-        is_red_rash = (c_r > 115 and c_r > c_g * 1.10 and c_r > c_b * 1.10) and (c_v > 105 or c_l > 110) and (prob_cnn is None or prob_cnn < 0.60)
+        # ---------------------------------------------------------------------
+        # 🔬 Melanin Depth & Color Space Metrics (วิเคราะห์ระดับความดำลึกของเม็ดสี)
+        # ---------------------------------------------------------------------
+        lab_metric = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        L_vals_in = lab_metric[..., 0][inside]
+        L_vals_out = lab_metric[..., 0][~inside]
+        a_vals_in = lab_metric[..., 1][inside]
+        a_vals_out = lab_metric[..., 1][~inside]
 
-        # คำนวณค่าความเชื่อมั่นแบบปรับเทียบ (Calibrated Confidence)
+        mean_L_in = float(L_vals_in.mean()) if len(L_vals_in) > 0 else 120.0
+        mean_L_out = float(L_vals_out.mean()) if len(L_vals_out) > 0 else 140.0
+        min_L_in = float(L_vals_in.min()) if len(L_vals_in) > 0 else 120.0
+        p10_L_in = float(np.percentile(L_vals_in, 10)) if len(L_vals_in) > 0 else 120.0
+        delta_L = mean_L_out - mean_L_in  # ความมืดเมื่อเทียบกับผิวรอบข้าง
+
+        # สัดส่วนพิกเซลที่ดำคล้ำลึก (Deep Melanin Pigmentation: L* < 76.0 ในระบบ Lab 0-255)
+        deep_dark_pixels = (L_vals_in < 76.0).sum() if len(L_vals_in) > 0 else 0
+        deep_dark_ratio = float(deep_dark_pixels) / max(float(len(L_vals_in)), 1.0)
+
+        # ดัชนีความแดง Erythema Index (RGB) และ Lab a* excess
+        r_in = img_rgb[..., 0][inside].astype(np.float32)
+        g_in = img_rgb[..., 1][inside].astype(np.float32)
+        b_in = img_rgb[..., 2][inside].astype(np.float32)
+        erythema_idx = float(((r_in - g_in) + (r_in - b_in)).mean()) if len(r_in) > 0 else 0.0
+        mean_a_in = float(a_vals_in.mean()) if len(a_vals_in) > 0 else 128.0
+        mean_a_out = float(a_vals_out.mean()) if len(a_vals_out) > 0 else 128.0
+        a_excess = mean_a_in - mean_a_out
+
+        # 1. ตรวจสอบผื่นแดงหรือรอยระคายเคืองที่ไม่มีเม็ดสีเมลานินคล้ำ (Erythema / Rash Guard)
+        # รอยโรคที่มีสีแดงเด่นชัด แต่ไม่มีเม็ดสีคล้ำ/ดำลึก (deep_dark_ratio ต่ำมาก และ delta_L ต่ำ)
+        is_red_rash = (
+            (erythema_idx > 28.0 or a_excess > 4.5) and
+            (deep_dark_ratio < 0.02) and
+            (delta_L < 8.0) and
+            (prob_cnn is None or prob_cnn < 0.65)
+        )
+
+        # 2. ตรวจสอบรอยฝ้า กระ หรือจุดด่างดำจากแสงแดด (Melasma / Solar Lentigo / Benign Hyperpigmentation Guard)
+        # ฝ้าและจุดด่างดำ: เป็นเม็ดสีผิวเผิน เรียบเนียน ไม่ขรุขระ (GLCM contrast ต่ำ), ไม่มีพิกเซลดำสนิท (p10_L > 78)
+        t_contrast = feats.get('T_glcm_contrast', 0.0)
+        t_homo = feats.get('T_glcm_homogeneity', 0.0)
+        is_smooth_texture = (t_contrast < 7.5 and t_homo > 0.25)
+        c_colors = int(feats.get('C_n_colors', 1))
+        is_tan_brown = (c_colors <= 2) and (p10_L_in > 78.0) and (deep_dark_ratio < 0.035)
+
+        # ตรวจสอบว่ารอยโรคแตะขอบภาพหรือไม่ (Touches border: พบบ่อยในภาพถ่ายแก้ม/ใบหน้าที่มีฝ้ากว้าง)
+        touches_border = bool(
+            (mask[0, :] > 0).any() or
+            (mask[-1, :] > 0).any() or
+            (mask[:, 0] > 0).any() or
+            (mask[:, -1] > 0).any()
+        )
+
+        # 3. เกราะคุ้มกันความลึกของเม็ดสีดำ (Melanin Depth Gatekeeper)
+        # มะเร็งผิวหนังชนิดเนื้อร้าย (Malignant Melanoma) ต้องมีเม็ดสีเมลานินสะสมลึกหนาแน่นจนเกิดจุดดำคล้ำ (L* < 76)
+        # หรือมีความขรุขระ/แปรปรวนของเนื้อเยื่อสูง (T_glcm_contrast >= 7.2)
+        has_deep_melanin = (deep_dark_ratio >= 0.03 or p10_L_in < 76.0 or delta_L >= 18.0)
+        has_nodular_texture = (t_contrast >= 7.2)
+        is_true_malignant_candidate = (has_deep_melanin or has_nodular_texture) and not (touches_border and not has_deep_melanin)
+
+        # หากไม่มีเม็ดสีดำลึก หรือเป็นรอยกว้างแตะขอบภาพ (เช่น ฝ้า/กระบนแก้ม) -> ห้ามขึ้นมะเร็งเสี่ยงสูงเด็ดขาด!
+        if not is_true_malignant_candidate and prob_malignant >= t_high:
+            prob_malignant = min(prob_malignant, 0.58)
+
+        # ตัดสินว่าจัดอยู่ในกลุ่มฝ้า/จุดด่างดำทั่วไปหรือไม่
+        is_benign_hyperpigmentation = (
+            (not has_deep_melanin) and
+            (not is_red_rash) and
+            (delta_L < 18.0) and
+            (is_smooth_texture or is_tan_brown or touches_border)
+        )
+
+        # ตัดสินระดับความเสี่ยง 3 ระดับ
+        is_malignant = (prob_malignant >= t_high)
+        is_watch = (t_low <= prob_malignant < t_high)
+
+        # คำนวณค่าความเชื่อมั่นแบบปรับเทียบ (Calibrated Confidence) ให้สอดคล้องกับแต่ละ Tier
         if is_plain_normal_skin:
             confidence = float(min(max((1.0 - prob_malignant) * 100.0, 92.0), 98.5))
         elif is_red_rash:
             confidence = float(min(max((1.0 - (prob_cnn or 0.2)) * 100.0, 85.0), 96.0))
+        elif is_benign_hyperpigmentation:
+            # รอยฝ้า / จุดด่างดำทั่วไป: มั่นใจสูงว่าเป็นกลุ่มเม็ดสีปกติที่ปลอดภัย
+            confidence = float(min(max((1.0 - (prob_cnn or 0.15)) * 100.0, 86.0), 96.5))
         elif is_malignant:
-            if prob_malignant >= loaded_t_hi:
-                confidence = float(prob_malignant * 100.0)
-            else:
-                calibrated = 50.0 + ((prob_malignant - screening_threshold) / max(1.0 - screening_threshold, 1e-6)) * 50.0
-                confidence = float(min(max(calibrated, 50.0), 99.0))
+            # เสี่ยงสูง (High Risk): prob >= 0.65 -> Calibrate ให้อยู่ในช่วง 80.0% - 99.0%
+            calibrated = 80.0 + ((prob_malignant - t_high) / max(1.0 - t_high, 1e-6)) * 19.0
+            confidence = float(min(max(calibrated, 80.0), 99.0))
+        elif is_watch:
+            # เฝ้าระวัง (Watch / Moderate): 0.35 <= prob < 0.65 (เช่นเคส 54.3% นี้)
+            # ความเชื่อมั่นของการจัดกลุ่มเฝ้าระวัง Calibrate ให้อยู่ในช่วง 78.0% - 89.5%
+            dist_from_mid = abs(prob_malignant - 0.50) / 0.15
+            certainty_in_tier = max(0.0, 1.0 - dist_from_mid)
+            calibrated = 78.0 + certainty_in_tier * 11.5
+            confidence = float(min(max(calibrated, 75.0), 89.5))
         else:
-            calibrated = 50.0 + ((screening_threshold - prob_malignant) / max(screening_threshold, 1e-6)) * 50.0
-            confidence = float(min(max(calibrated, 50.0), 99.0))
+            # เสี่ยงต่ำ / ปกติ (Low Risk): prob < 0.35 -> Calibrate ให้อยู่ในช่วง 80.0% - 98.5%
+            calibrated = 80.0 + ((t_low - prob_malignant) / max(t_low, 1e-6)) * 18.5
+            confidence = float(min(max(calibrated, 78.0), 98.5))
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -837,20 +987,31 @@ async def predict(file: UploadFile = File(...)):
         disease_name = "ผิวปกติ / ไม่พบเนื้อร้าย (ตรวจพบผื่นแดง/การระคายเคือง)"
         risk_level = "low"
         message = "ภาพตรวจพบผื่นแดงหรือรอยระคายเคืองผิวหนัง ไม่พบการสะสมของเม็ดสีเมลานินผิดปกติ และไม่พบสัญญาณของมะเร็งผิวหนัง"
-    elif seg_q < 0.15 and not is_malignant and prob_cnn is None:
+    elif is_benign_hyperpigmentation:
+        is_uncertain = False
+        disease_name = "จุดด่างดำ / ฝ้าแดดทั่วไป (Hyperpigmentation)"
+        risk_level = "low"
+        message = "ตรวจพบรอยคล้ำเม็ดสีผิวสม่ำเสมอ ผิวเรียบเนียน สอดคล้องกับฝ้า กระ หรือจุดด่างดำจากแสงแดดทั่วไป ปลอดภัยไม่พบสัญญาณของเนื้อร้าย"
+    elif seg_q < 0.15 and not is_malignant and not is_watch and prob_cnn is None:
         is_uncertain = True
         disease_name = "ความมั่นใจต่ำกว่าเกณฑ์ความปลอดภัย (Uncertain)"
         risk_level = "uncertain"
         message = "แยกขอบเขตรอยโรคออกจากผิวหนังได้ไม่ชัดเจน เพื่อความปลอดภัยทางการแพทย์จึงไม่ฟันธงผล กรุณาถ่ายภาพระยะประชิดให้ชัดเจนอีกครั้งค่ะ"
+    elif is_malignant:
+        is_uncertain = False
+        disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)"
+        risk_level = "high"
+        message = "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามโครงข่ายประสาทเทียม CNN และเกณฑ์ ABCD ในระดับสูง ควรรีบพบแพทย์ผิวหนังโดยเร็ว"
+    elif is_watch:
+        is_uncertain = False
+        disease_name = "ไฝผิดปกติเฝ้าระวัง (Atypical Nevus)"
+        risk_level = "medium"
+        message = "ตรวจพบคุณลักษณะของรอยโรคที่มีความผิดปกติก้ำกึ่งตามเกณฑ์ ABCD จัดอยู่ในระดับเฝ้าระวัง ควรตรวจติดตามการเปลี่ยนแปลง หรือปรึกษาแพทย์ผิวหนังเพื่อตรวจเช็คอย่างสม่ำเสมอ"
     else:
         is_uncertain = False
-        disease_name = "มะเร็งผิวหนัง (Malignant Melanoma)" if is_malignant else "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
-        risk_level = "high" if is_malignant else "low"
-        message = (
-            "ตรวจพบความผิดปกติที่สอดคล้องกับเนื้อร้ายตามโครงข่ายประสาทเทียม CNN และเกณฑ์ ABCD ควรรีบพบแพทย์ผิวหนังโดยเร็ว"
-            if is_malignant else
-            "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
-        )
+        disease_name = "ไฝปกติ / ไม่พบเนื้อร้าย (Benign)"
+        risk_level = "low"
+        message = "รอยโรคมีลักษณะสมมาตร ขอบมนเรียบ สีสม่ำเสมอ ปลอดภัยไม่พบสัญญาณมะเร็งผิวหนัง"
 
     asym_val = feats.get('A_asym_mean', 0.0)
     comp_val = feats.get('B_compactness', 1.0)
