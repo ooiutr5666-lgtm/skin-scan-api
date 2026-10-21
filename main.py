@@ -654,7 +654,7 @@ def read_root():
             "threshold": float(loaded_t_lo),
             "threshold_screening": float(loaded_t_lo),
             "threshold_precision": float(loaded_t_hi),
-            "version": "v4.3-melanin-gatekeeper-3tier",
+            "version": "v4.4-clinical-precision",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
@@ -864,12 +864,22 @@ async def predict(file: UploadFile = File(...)):
             prob_malignant = float(prob_hand)
             active_model_desc = "Handcrafted ABCD + SVM Pipeline (SVM 100%)"
 
-        # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์ตามสเปกตรัมคลินิก 3 ระดับ (3-Tier Clinical Continuum)
-        t_low = 0.35
-        t_high = 0.65
+        # ดึงฟีเจอร์ ABCD และเนื้อสัมผัสมาใช้งานในการตัดสิน
+        asym_val = feats.get('A_asym_mean', 0.0)
+        comp_val = feats.get('B_compactness', 1.0)
+        colors_count = int(feats.get('C_n_colors', 1))
+        equiv_d = feats.get('D_equiv_diameter', 0.0)
+        glcm_contrast = feats.get('T_glcm_contrast', 0.0)
+
+        # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์ตามสเปกตรัมคลินิก (Clinical Decision Thresholds)
+        # จุดตัดเสี่ยงสูง (Malignant): prob >= 0.50 (ครอบคลุมรอยโรคมะเร็งจริง 54% ขึ้นไป)
+        # จุดตัดเฝ้าระวัง (Watch / Atypical): 0.28 <= prob < 0.50
+        # เสี่ยงต่ำ (Low Risk / Benign): prob < 0.28
+        t_low = 0.28
+        t_high = 0.50
 
         # ตรวจสอบกรณีเป็นภาพผิวหนังปกติที่ไม่มีรอยโรคชัดเจน และ AI ประเมินว่าความเสี่ยงต่ำ
-        is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.30)
+        is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.28)
 
         # ---------------------------------------------------------------------
         # 🔬 Melanin Depth & Color Space Metrics (วิเคราะห์ระดับความดำลึกของเม็ดสี)
@@ -900,23 +910,17 @@ async def predict(file: UploadFile = File(...)):
         a_excess = mean_a_in - mean_a_out
 
         # 1. ตรวจสอบผื่นแดงหรือรอยระคายเคืองที่ไม่มีเม็ดสีเมลานินคล้ำ (Erythema / Rash Guard)
-        # รอยโรคที่มีสีแดงเด่นชัด แต่ไม่มีเม็ดสีคล้ำ/ดำลึก (deep_dark_ratio ต่ำมาก และ delta_L ต่ำ)
+        # รอยโรคที่มีสีแดงเด่นชัด แต่ไม่มีเม็ดสีคล้ำ/ดำลึกเลย
         is_red_rash = (
             (erythema_idx > 28.0 or a_excess > 4.5) and
-            (deep_dark_ratio < 0.02) and
+            (deep_dark_ratio < 0.015) and
             (delta_L < 8.0) and
-            (prob_cnn is None or prob_cnn < 0.65)
+            (p10_L_in > 78.0)
         )
 
-        # 2. ตรวจสอบรอยฝ้า กระ หรือจุดด่างดำจากแสงแดด (Melasma / Solar Lentigo / Benign Hyperpigmentation Guard)
-        # ฝ้าและจุดด่างดำ: เป็นเม็ดสีผิวเผิน เรียบเนียน ไม่ขรุขระ (GLCM contrast ต่ำ), ไม่มีพิกเซลดำสนิท (p10_L > 78)
-        t_contrast = feats.get('T_glcm_contrast', 0.0)
-        t_homo = feats.get('T_glcm_homogeneity', 0.0)
-        is_smooth_texture = (t_contrast < 7.5 and t_homo > 0.25)
-        c_colors = int(feats.get('C_n_colors', 1))
-        is_tan_brown = (c_colors <= 2) and (p10_L_in > 78.0) and (deep_dark_ratio < 0.035)
-
-        # ตรวจสอบว่ารอยโรคแตะขอบภาพหรือไม่ (Touches border: พบบ่อยในภาพถ่ายแก้ม/ใบหน้าที่มีฝ้ากว้าง)
+        # 2. ตรวจสอบรอยฝ้า กระ หรือจุดด่างดำบนใบหน้า (Diffuse Facial Melasma Guard)
+        # ฝ้าบนแก้ม: เป็นปื้นกว้าง แผ่ชนขอบภาพ ผิวเรียบเนียน ไม่ขรุขระ ไม่ใช่เม็ดไฝนูน และไม่มีพิกเซลดำลึก
+        is_smooth_texture = (glcm_contrast < 6.8)
         touches_border = bool(
             (mask[0, :] > 0).any() or
             (mask[-1, :] > 0).any() or
@@ -924,24 +928,25 @@ async def predict(file: UploadFile = File(...)):
             (mask[:, -1] > 0).any()
         )
 
-        # 3. เกราะคุ้มกันความลึกของเม็ดสีดำ (Melanin Depth Gatekeeper)
-        # มะเร็งผิวหนังชนิดเนื้อร้าย (Malignant Melanoma) ต้องมีเม็ดสีเมลานินสะสมลึกหนาแน่นจนเกิดจุดดำคล้ำ (L* < 76)
-        # หรือมีความขรุขระ/แปรปรวนของเนื้อเยื่อสูง (T_glcm_contrast >= 7.2)
-        has_deep_melanin = (deep_dark_ratio >= 0.03 or p10_L_in < 76.0 or delta_L >= 18.0)
-        has_nodular_texture = (t_contrast >= 7.2)
-        is_true_malignant_candidate = (has_deep_melanin or has_nodular_texture) and not (touches_border and not has_deep_melanin)
-
-        # หากไม่มีเม็ดสีดำลึก หรือเป็นรอยกว้างแตะขอบภาพ (เช่น ฝ้า/กระบนแก้ม) -> ห้ามขึ้นมะเร็งเสี่ยงสูงเด็ดขาด!
-        if not is_true_malignant_candidate and prob_malignant >= t_high:
-            prob_malignant = min(prob_malignant, 0.58)
-
-        # ตัดสินว่าจัดอยู่ในกลุ่มฝ้า/จุดด่างดำทั่วไปหรือไม่
-        is_benign_hyperpigmentation = (
-            (not has_deep_melanin) and
-            (not is_red_rash) and
-            (delta_L < 18.0) and
-            (is_smooth_texture or is_tan_brown or touches_border)
+        is_facial_melasma = (
+            touches_border and
+            (lesion_ratio > 0.20) and
+            (delta_L < 15.0) and
+            (deep_dark_ratio < 0.02) and
+            (p10_L_in > 74.0) and
+            is_smooth_texture and
+            (comp_val < 1.6) and
+            (asym_val < 0.35) and
+            not is_red_rash
         )
+
+        # หากเป็นฝ้าบนแก้มที่ AI ทายเพี้ยนสูง -> ปรับลดระดับความเสี่ยงให้อยู่ในกลุ่มปลอดภัย
+        if is_facial_melasma:
+            prob_malignant = min(prob_malignant, 0.20)
+
+        # หากเป็นผื่นแดง -> ปรับลดระดับความเสี่ยงให้อยู่ในกลุ่มปลอดภัย
+        if is_red_rash:
+            prob_malignant = min(prob_malignant, 0.20)
 
         # ตัดสินระดับความเสี่ยง 3 ระดับ
         is_malignant = (prob_malignant >= t_high)
@@ -952,24 +957,21 @@ async def predict(file: UploadFile = File(...)):
             confidence = float(min(max((1.0 - prob_malignant) * 100.0, 92.0), 98.5))
         elif is_red_rash:
             confidence = float(min(max((1.0 - (prob_cnn or 0.2)) * 100.0, 85.0), 96.0))
-        elif is_benign_hyperpigmentation:
-            # รอยฝ้า / จุดด่างดำทั่วไป: มั่นใจสูงว่าเป็นกลุ่มเม็ดสีปกติที่ปลอดภัย
+        elif is_facial_melasma:
             confidence = float(min(max((1.0 - (prob_cnn or 0.15)) * 100.0, 86.0), 96.5))
         elif is_malignant:
-            # เสี่ยงสูง (High Risk): prob >= 0.65 -> Calibrate ให้อยู่ในช่วง 80.0% - 99.0%
-            calibrated = 80.0 + ((prob_malignant - t_high) / max(1.0 - t_high, 1e-6)) * 19.0
-            confidence = float(min(max(calibrated, 80.0), 99.0))
+            # เสี่ยงสูง (High Risk): prob >= 0.50 -> Calibrate ให้อยู่ในช่วง 82.0% - 98.5%
+            calibrated = 82.0 + ((prob_malignant - t_high) / max(1.0 - t_high, 1e-6)) * 16.5
+            confidence = float(min(max(calibrated, 82.0), 98.5))
         elif is_watch:
-            # เฝ้าระวัง (Watch / Moderate): 0.35 <= prob < 0.65 (เช่นเคส 54.3% นี้)
-            # ความเชื่อมั่นของการจัดกลุ่มเฝ้าระวัง Calibrate ให้อยู่ในช่วง 78.0% - 89.5%
-            dist_from_mid = abs(prob_malignant - 0.50) / 0.15
-            certainty_in_tier = max(0.0, 1.0 - dist_from_mid)
-            calibrated = 78.0 + certainty_in_tier * 11.5
-            confidence = float(min(max(calibrated, 75.0), 89.5))
+            # เฝ้าระวัง (Watch / Moderate): 0.28 <= prob < 0.50
+            # ความเชื่อมั่นของการจัดกลุ่มเฝ้าระวัง Calibrate ให้อยู่ในช่วง 75.0% - 88.0%
+            calibrated = 75.0 + ((prob_malignant - t_low) / max(t_high - t_low, 1e-6)) * 13.0
+            confidence = float(min(max(calibrated, 75.0), 88.0))
         else:
-            # เสี่ยงต่ำ / ปกติ (Low Risk): prob < 0.35 -> Calibrate ให้อยู่ในช่วง 80.0% - 98.5%
-            calibrated = 80.0 + ((t_low - prob_malignant) / max(t_low, 1e-6)) * 18.5
-            confidence = float(min(max(calibrated, 78.0), 98.5))
+            # เสี่ยงต่ำ / ปกติ (Low Risk): prob < 0.28 -> Calibrate ให้อยู่ในช่วง 82.0% - 98.5%
+            calibrated = 82.0 + ((t_low - prob_malignant) / max(t_low, 1e-6)) * 16.0
+            confidence = float(min(max(calibrated, 80.0), 98.5))
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -987,7 +989,7 @@ async def predict(file: UploadFile = File(...)):
         disease_name = "ผิวปกติ / ไม่พบเนื้อร้าย (ตรวจพบผื่นแดง/การระคายเคือง)"
         risk_level = "low"
         message = "ภาพตรวจพบผื่นแดงหรือรอยระคายเคืองผิวหนัง ไม่พบการสะสมของเม็ดสีเมลานินผิดปกติ และไม่พบสัญญาณของมะเร็งผิวหนัง"
-    elif is_benign_hyperpigmentation:
+    elif is_facial_melasma:
         is_uncertain = False
         disease_name = "จุดด่างดำ / ฝ้าแดดทั่วไป (Hyperpigmentation)"
         risk_level = "low"
