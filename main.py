@@ -523,51 +523,35 @@ def normalize_color_illumination(img_rgb):
     balanced[:, :, 2] = img_float[:, :, 2] * scale_b
     return np.clip(balanced, 0, 255).astype(np.uint8)
 
-# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold - HSV + YCrCb + RGB + Texture Variance)
+# ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่ (Skin Color Threshold - HSV + YCrCb + RGB)
 def check_is_skin(img_rgb):
     if not OPENCV_AVAILABLE:
         return True
     
-    # 1. ตรวจสอบใน HSV Space (ผิวหนังมนุษย์ทุกเฉดสี H: 0-25 หรือ 168-180, S: 15-220, V: 45-255)
+    # 1. ตรวจสอบใน HSV Space
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    lower_hsv1 = np.array([0, 15, 45], dtype=np.uint8)
-    upper_hsv1 = np.array([25, 220, 255], dtype=np.uint8)
-    mask_hsv1 = cv2.inRange(hsv, lower_hsv1, upper_hsv1)
+    lower_hsv = np.array([0, 15, 35], dtype=np.uint8)
+    upper_hsv = np.array([28, 255, 255], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
 
-    lower_hsv2 = np.array([168, 15, 45], dtype=np.uint8)
-    upper_hsv2 = np.array([180, 220, 255], dtype=np.uint8)
-    mask_hsv2 = cv2.inRange(hsv, lower_hsv2, upper_hsv2)
-    mask_hsv = (mask_hsv1 > 0) | (mask_hsv2 > 0)
-
-    # 2. ตรวจสอบใน YCrCb Space (มาตรฐานสากลตรวจจับผิวหนังมนุษย์: Cr 133-173, Cb 77-127)
+    # 2. ตรวจสอบใน YCrCb Space (มาตรฐานสากลตรวจจับผิวหนังมนุษย์)
     ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
     lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
     upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
-    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb) > 0
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
 
     # 3. ตรวจสอบเงื่อนไขพิกเซลสีผิว (RGB Bounds)
     r = img_rgb[:, :, 0].astype(np.int16)
     g = img_rgb[:, :, 1].astype(np.int16)
     b = img_rgb[:, :, 2].astype(np.int16)
-    # ผิวจริงต้องมีโทนแดงนำ และไม่ใช่สีเทา วัตถุ หรือกระดาษขาว
-    rgb_rule = (r > 60) & (g > 35) & (b > 25) & (r > g) & (r > b) & ((r - g) >= 8) & ((r - b) >= 12)
+    rgb_rule = (r > 45) & (g > 25) & (b > 15) & (r >= g) & (r >= b)
 
-    # รวม Mask ของผิวหนัง (ต้องผ่านทั้ง HSV/YCrCb และ RGB Rule)
-    skin_mask = (mask_hsv | mask_ycrcb) & rgb_rule
+    # รวม Mask ของผิวหนัง
+    skin_mask = ((mask_hsv > 0) | (mask_ycrcb > 0)) & rgb_rule
     ratio = float(skin_mask.sum()) / float(img_rgb.shape[0] * img_rgb.shape[1])
     
-    # ภาพถ่ายผิวหนังหรือไฝระยะประชิด ต้องมีสัดส่วนผิวหนังอย่างน้อย 38%
-    if ratio < 0.38:
-        return False
-
-    # ตรวจสอบว่าไม่ใช่วัตถุที่มีเส้นลายพิมพ์หรือขอบคมกระจายทั้งภาพ (Text / Dense Pattern / Fabric Filter)
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    # ถ้า laplacian_var สูงผิดปกติมาก (> 1500) มักเป็นลายพิมพ์ตัวหนังสือ ลายผ้า หรือสิ่งของ ไม่ใช่ผิวหนังมนุษย์
-    if laplacian_var > 1500.0:
-        return False
-
-    return True
+    # ภาพถ่ายผิวหนังหรือรอยโรค Dermoscopy ต้องมีสัดส่วนผิวหนังอย่างน้อย 15% (เนื่องจากรอยโรคมะเร็งหรือขอบเลนส์อาจกินพื้นที่ส่วนใหญ่)
+    return ratio >= 0.15
 
 # ตรวจสอบการมีอยู่ของเม็ดสีเมลานิน (Melanin Pigment & Clinical Scope Guard)
 # ไฝและมะเร็งผิวหนังตามเกณฑ์ ISIC (Melanocytic Lesions) ต้องมีเม็ดสีเมลานินเข้ม (น้ำตาล/ดำ/เทา)
@@ -654,7 +638,7 @@ def read_root():
             "threshold": float(loaded_t_lo),
             "threshold_screening": float(loaded_t_lo),
             "threshold_precision": float(loaded_t_hi),
-            "version": "v4.4-clinical-precision",
+            "version": "v4.5-dermoscopy-restore",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
@@ -673,9 +657,8 @@ async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert('RGB')
     
-    # ปรับขนาดมาตรฐานการประมวลผล และปรับสมดุลแสงสี (Illumination & Color Constancy Normalization)
-    img_rgb_raw = np.array(image.resize((224, 224)))
-    img_rgb = normalize_color_illumination(img_rgb_raw)
+    # ปรับขนาดมาตรฐานการประมวลผล 224x224 (ตามที่โมเดล EfficientNetB0 และ SVM ถูกฝึกสอนมาจริง)
+    img_rgb = np.array(image.resize((224, 224)))
 
     # ตรวจสอบว่าเป็นภาพผิวหนังหรือไม่
     is_skin = check_is_skin(img_rgb)
@@ -748,8 +731,8 @@ async def predict(file: UploadFile = File(...)):
         }
 
     # 2. รอยโรคใหญ่เกินขอบเขตรอยโรคเดี่ยว (Lesion Too Large / Shadow / Obstructed)
-    # หากรอยโรคกินพื้นที่เกิน 65% ของทั้งภาพ มักเป็นเงามืด เงาเสื้อผ้า หรือถ่ายนอกระยะ
-    if lesion_ratio > 0.65:
+    # หากรอยโรคกินพื้นที่เกิน 88% ของทั้งภาพ มักเป็นเงามืด เงาเสื้อผ้า หรือถ่ายนอกระยะ
+    if lesion_ratio > 0.88:
         return {
             "is_skin": False,
             "is_out_of_scope": True,
