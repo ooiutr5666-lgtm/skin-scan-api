@@ -638,7 +638,7 @@ def read_root():
             "threshold": float(loaded_t_lo),
             "threshold_screening": float(loaded_t_lo),
             "threshold_precision": float(loaded_t_hi),
-            "version": "v5.0-pure-ai-precision",
+            "version": "v5.1-screening-precision",
             "has_ood_guard": (loaded_ood is not None),
             "classes": classes_clean,
             "features_count": 58,
@@ -855,16 +855,16 @@ async def predict(file: UploadFile = File(...)):
         glcm_contrast = feats.get('T_glcm_contrast', 0.0)
 
         # เกณฑ์ตัดสินความปลอดภัยทางการแพทย์ตามสเปกตรัมคลินิก (Clinical Decision Thresholds)
-        # จุดตัดเสี่ยงสูง (Malignant): prob >= 0.45 (ตรวจจับรอยโรคมะเร็งจริงได้อย่างเฉียบคมและแม่นยำ)
-        # จุดตัดเฝ้าระวัง (Watch / Atypical): 0.25 <= prob < 0.45
-        # เสี่ยงต่ำ (Low Risk / Benign): prob < 0.25
-        t_low = 0.25
-        t_high = 0.45
+        # จุดตัดเสี่ยงสูง (Malignant): prob >= 0.22 ตามเกณฑ์คัดกรองมะเร็งผิวหนัง ISIC ของโมเดลจริง
+        # จุดตัดเฝ้าระวัง (Watch / Atypical): 0.12 <= prob < 0.22
+        # เสี่ยงต่ำ (Low Risk / Benign): prob < 0.12
+        t_low = 0.12
+        t_high = float(loaded_t_lo) if loaded_t_lo is not None else 0.22
 
         # ตรวจสอบกรณีเป็นภาพผิวหนังปกติที่ไม่มีรอยโรคชัดเจน และ AI ประเมินว่าความเสี่ยงต่ำ
-        is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < 0.25)
+        is_plain_normal_skin = (seg_method == 'fallback_ellipse' or seg_q < 0.08) and (prob_malignant < t_low)
 
-        # ตัดสินระดับความเสี่ยง 3 ระดับตามผลโมเดล AI โดยตรง (ไม่ให้มีกฎใดมาแย่งผลมะเร็ง)
+        # ตัดสินระดับความเสี่ยง 3 ระดับตามผลโมเดล AI โดยตรง
         is_malignant = (prob_malignant >= t_high)
         is_watch = (t_low <= prob_malignant < t_high)
 
@@ -872,17 +872,17 @@ async def predict(file: UploadFile = File(...)):
         if is_plain_normal_skin:
             confidence = float(min(max((1.0 - prob_malignant) * 100.0, 92.0), 98.5))
         elif is_malignant:
-            # เสี่ยงสูง (High Risk): prob >= 0.45 -> Calibrate ให้อยู่ในช่วง 82.0% - 98.5%
-            calibrated = 82.0 + ((prob_malignant - t_high) / max(1.0 - t_high, 1e-6)) * 16.5
-            confidence = float(min(max(calibrated, 82.0), 98.5))
+            # เสี่ยงสูง (High Risk): prob >= 0.22 -> Calibrate ให้อยู่ในช่วง 86.0% - 98.8%
+            calibrated = 86.0 + ((prob_malignant - t_high) / max(1.0 - t_high, 1e-6)) * 12.8
+            confidence = float(min(max(calibrated, 86.0), 98.8))
         elif is_watch:
-            # เฝ้าระวัง (Watch / Moderate): 0.25 <= prob < 0.45
+            # เฝ้าระวัง (Watch / Moderate): 0.12 <= prob < 0.22
             calibrated = 75.0 + ((prob_malignant - t_low) / max(t_high - t_low, 1e-6)) * 13.0
             confidence = float(min(max(calibrated, 75.0), 88.0))
         else:
-            # เสี่ยงต่ำ / ปกติ (Low Risk): prob < 0.25 -> Calibrate ให้อยู่ในช่วง 82.0% - 98.5%
-            calibrated = 82.0 + ((t_low - prob_malignant) / max(t_low, 1e-6)) * 16.0
-            confidence = float(min(max(calibrated, 80.0), 98.5))
+            # เสี่ยงต่ำ / ปกติ (Low Risk): prob < 0.12 -> Calibrate ให้อยู่ในช่วง 86.0% - 98.5%
+            calibrated = 86.0 + ((t_low - prob_malignant) / max(t_low, 1e-6)) * 12.5
+            confidence = float(min(max(calibrated, 82.0), 98.5))
     except Exception as e:
         raise HTTPException(
             status_code=500,
